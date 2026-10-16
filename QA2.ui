@@ -1,0 +1,183 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<ui version="4.0">
+ <class>MainWindow</class>
+ <widget class="QMainWindow" name="MainWindow">
+  <property name="geometry">
+   <rect>
+    <x>0</x>
+    <y>0</y>
+    <width>1600</width>
+    <height>1000</height>
+   </rect>
+  </property>
+  <property name="minimumSize">
+   <size>
+    <width>1200</width>
+    <height>800</height>
+   </size>
+  </property>
+  <property name="windowTitle">
+   <string>MCOE Audit</string>
+  </property>
+
+  <widget class="QWidget" name="centralwidget">
+   <layout class="QVBoxLayout" name="verticalLayout">
+
+    <item>
+     <widget class="QLabel" name="header">
+      <property name="text">
+       <string>MCOE AUDIT</string>
+      </property>
+     </widget>
+    </item>
+
+    <item>
+     <layout class="QHBoxLayout" name="bomPdfLayout">
+      <item>
+       <widget class="QPushButton" name="browse_pdf_btn">
+        <property name="text">
+         <string>Browse Job Folder...</string>
+        </property>
+       </widget>
+      </item>
+      <item>
+       <widget class="QLabel" name="bom_pdf_label">
+        <property name="text">
+         <string>No job folder loaded.</string>
+        </property>
+       </widget>
+      </item>
+      <item>
+       <widget class="QPushButton" name="start_btn">
+        <property name="enabled">
+         <bool>false</bool>
+        </property>
+        <property name="text">
+         <string>Start Automation</string>
+        </property>
+       </widget>
+      </item>
+     </layout>
+    </item>
+
+    <item>
+        <widget class="QCheckBox" name="test_scope_checkbox">
+         <property name="text">
+          <string>Structure 2 only (test scope)</string>
+         </property>
+         <property name="checked">
+          <bool>false</bool>
+         </property>
+        </widget>
+        </item>
+
+        <item>
+     <widget class="QLabel" name="enclosure_label">
+      <property name="text">
+       <string>Enclosure Type: —</string>
+      </property>
+     </widget>
+    </item>
+
+    <item>
+     <widget class="QLabel" name="scan_status">
+      <property name="text">
+       <string>0/0 Checks Completed</string>
+      </property>
+     </widget>
+    </item>
+
+    <item>
+     <widget class="QProgressBar" name="progress">
+      <property name="value">
+       <number>0</number>
+      </property>
+     </widget>
+    </item>
+
+    <item>
+     <widget class="QGroupBox" name="centerGroup">
+      <property name="title">
+       <string>Structured BOM Checklist (Section-wise)</string>
+      </property>
+
+      <layout class="QVBoxLayout" name="centerLayout">
+       <item>
+        <widget class="QTreeWidget" name="bom_list">
+         <column>
+          <property name="text">
+           <string>Assembly</string>
+          </property>
+         </column>
+         <column>
+          <property name="text">
+           <string>Description</string>
+          </property>
+         </column>
+         <column>
+          <property name="text">
+           <string>Name</string>
+          </property>
+         </column>
+         <column>
+          <property name="text">
+           <string>Code</string>
+          </property>
+         </column>
+         <column>
+          <property name="text">
+           <string>Parameter 1</string>
+          </property>
+         </column>
+         <column>
+          <property name="text">
+           <string>Parameter 2</string>
+          </property>
+         </column>
+         <column>
+          <property name="text">
+           <string>Parameter 3</string>
+          </property>
+         </column>
+         <column>
+          <property name="text">
+           <string>Parameter 4</string>
+          </property>
+         </column>
+         <column>
+          <property name="text">
+           <string>Parameter 5</string>
+          </property>
+         </column>
+         <column>
+          <property name="text">
+           <string>Expected Group</string>
+          </property>
+         </column>
+         <column>
+          <property name="text">
+           <string>Actual Group</string>
+          </property>
+         </column>
+         <column>
+          <property name="text">
+           <string>Status</string>
+          </property>
+         </column>
+        </widget>
+       </item>
+      </layout>
+     </widget>
+    </item>
+
+   </layout>
+  </widget>
+
+  <widget class="QMenuBar" name="menubar"/>
+  <widget class="QStatusBar" name="statusbar"/>
+
+ </widget>
+
+ <resources/>
+ <connections/>
+</ui>
