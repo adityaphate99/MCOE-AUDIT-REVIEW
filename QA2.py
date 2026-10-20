@@ -16,6 +16,7 @@ from PyQt6.QtWidgets import (
     QCheckBox,
     QComboBox,
     QFrame,
+    QGraphicsOpacityEffect,
     QLabel,
     QStyle,
     QAbstractItemView,
@@ -31,8 +32,8 @@ from PyQt6.QtWidgets import (
     QVBoxLayout,
     QWidget,
 )
-from PyQt6.QtGui import QFont, QColor, QBrush
-from PyQt6.QtCore import Qt, QStringListModel
+from PyQt6.QtGui import QFont, QColor, QBrush, QTextOption
+from PyQt6.QtCore import QEasingCurve, QPropertyAnimation, Qt, QStringListModel
 
 from PyQt6.uic import loadUi
 
@@ -838,6 +839,15 @@ def assembly_bus_requirements(requirements, section_number, description):
     return requirements.get(int(section_number)) if section_number is not None else None
 
 
+def extract_table_selectors(text, source):
+    repository = ParameterRepository()
+    for name in ("NG Drawout", "Structure Material", "Test Plug", "Metering Configuration", "Table Row", "Door Vents"):
+        pattern = rf"(?im)^\s*{re.escape(name)}\s*[:=]\s*([^\r\n]+)"
+        for match in re.finditer(pattern, text):
+            repository.add_parameter(name, match.group(1).strip(), source)
+    return repository
+
+
 class DWGFile:
     """Reads labeled text and block attributes from a native DWG via AutoCAD COM."""
 
@@ -1197,6 +1207,7 @@ class GridMatch:
     title_text: str            # all title rows of the sheet
     group: str = ""
     axis_values: tuple[tuple[str, str], ...] = ()
+    required_parameters: tuple[str, ...] = ()
 
     @property
     def sheet_width(self):
@@ -1255,9 +1266,16 @@ def find_dimension_grid_matches(values, sheet_name, base, group):
                     actual = _cell_text(_cell_at(row, column))
                     if not GROUP_CODE_RE.fullmatch(actual) or actual == "N/A" or (group and actual != group.upper()):
                         continue
+                    axes = [("Width (Wide)", _format_dim(float(width))), ("Depth", depth)]
+                    height = re.search(r'(\d+)\s*"?\s*HIGH\b', section)
+                    if height:
+                        axes.append(("Height", height.group(1)))
+                    enclosure = re.search(r"NEMA\s*(3R|1)\b", sheet_name.upper())
+                    if enclosure:
+                        axes.append(("NEMA 1/3R", enclosure.group(1)))
                     matches.append(GridMatch(
                         sheet_name, (), section, (), "", actual,
-                        (("Width (Wide)", _format_dim(float(width))), ("Depth", depth)),
+                        tuple(axes), tuple(name for name, _value in axes),
                     ))
     return matches if recognized else None
 
@@ -1299,9 +1317,100 @@ def find_assembly_column_matches(values, sheet_name, base, group):
     return matches
 
 
+def find_smart_table_matches(values, sheet_name, base, group):
+    matches = []
+    recognized = False
+    aliases = {
+        "STRUCTUREWIDTH": "Width (Wide)", "STRUCTUREDEPTH": "Depth",
+        "STRUCTUREHEIGHT": "Height", "SEISMIC": "Seismic/Non-Seismic",
+        "STRUCTUREMATERIAL": "Structure Material", "NGDRAWOUT": "NG Drawout",
+    }
+    style_pattern = re.compile(rf"{re.escape(base.upper())}(G\d+|H\d+)")
+    for marker_index, marker in enumerate(values[:-1]):
+        inputs = next((column for column, cell in enumerate(marker) if _cell_text(cell) == "INPUT"), None)
+        outputs = next((column for column, cell in enumerate(marker) if _cell_text(cell) == "OUTPUT"), None)
+        if inputs is None or outputs is None or inputs >= outputs:
+            continue
+        end = next((column for column in range(outputs + 1, len(marker)) if _cell_text(marker[column])), len(marker))
+        header = values[marker_index + 1]
+        for row_number, row in enumerate(values[marker_index + 2:], marker_index + 3):
+            axes = []
+            for column in range(inputs, outputs):
+                name = _cell_text(_cell_at(header, column))
+                value = _cell_text(_cell_at(row, column))
+                if name and value and value != "N/A":
+                    axes.append((aliases.get(normalize_code(name), name.title()), value))
+            enclosure = re.search(r"TYPE\s+(3R|1)\b", sheet_name.upper())
+            if enclosure:
+                axes.append(("NEMA 1/3R", enclosure.group(1)))
+            for column in range(outputs, end):
+                style = style_pattern.fullmatch(_cell_text(_cell_at(row, column)))
+                if style:
+                    recognized = True
+                    if not group or style.group(1) == group.upper():
+                        matches.append(GridMatch(
+                            sheet_name, (), _cell_text(_cell_at(header, column)), (), "",
+                            style.group(1), tuple(axes), tuple(name for name, _value in axes),
+                        ))
+    return matches if recognized else None
+
+
+def find_labeled_table_matches(values, sheet_name, base, group):
+    matches = []
+    recognized = False
+    base_pattern = re.compile(rf"(?<![A-Z0-9]){re.escape(base.upper())}(?![A-Z0-9])")
+    for header_index, header in enumerate(values):
+        labels = [_cell_text(value) for value in header]
+        depth_column = next((column for column, label in enumerate(labels) if label == "DEPTH"), None)
+        group_column = next((column for column, label in enumerate(labels) if label == "GROUP"), None)
+        description_column = next((column for column, label in enumerate(labels) if label == "DESCRIPTION"), None)
+        widths = {column: hit.group(1) for column, label in enumerate(labels) if (hit := SHEET_WIDTH_RE.fullmatch(label))}
+        if not ((depth_column is not None and group_column is not None) or (description_column is not None and widths)):
+            continue
+        context = values[max(0, header_index - 4):header_index]
+        if not any(base_pattern.search(_cell_text(value)) for row in context for value in row):
+            continue
+        recognized = True
+        section = next((
+            _cell_text(value) for row in reversed(context) for value in row
+            if _cell_text(value) and not base_pattern.search(_cell_text(value))
+        ), "")
+        for row in values[header_index + 1:]:
+            if depth_column is not None and group_column is not None:
+                depth = re.fullmatch(r"(\d+(?:\.\d+)?)D", _cell_text(_cell_at(row, depth_column)))
+                if not depth:
+                    break
+                actual = _cell_text(_cell_at(row, group_column))
+                if GROUP_CODE_RE.fullmatch(actual) and actual != "N/A" and (not group or actual == group.upper()):
+                    matches.append(GridMatch(sheet_name, (), section, (), "", actual, (("Depth", depth.group(1)),), ("Depth",)))
+                continue
+            label = _cell_text(_cell_at(row, description_column))
+            if label in ("DESCRIPTION", "WITH TEST PLUG", "W/O TEST PLUG", "BLANK DOORS", "L-SHAPED MOUNTING PAN") or DRAWING_TOKEN_RE.fullmatch(label):
+                break
+            if not label:
+                continue
+            for column, width in widths.items():
+                actual = _cell_text(_cell_at(row, column))
+                if not GROUP_CODE_RE.fullmatch(actual) or actual == "N/A" or (group and actual != group.upper()):
+                    continue
+                axes = [("Width (Wide)", width), ("Table Row", label)]
+                if "TEST PLUG" in section:
+                    axes.append(("Test Plug", "WITHOUT" if section.startswith("W/O") else "WITH"))
+                matches.append(GridMatch(sheet_name, (), section, (), "", actual, tuple(axes), tuple(name for name, _value in axes)))
+    return matches if recognized else None
+
+
 def find_grid_group_matches(values, sheet_name, base, group):
     """Grid layouts (e.g. WCUTO22XMAIN, UGPORD2) put the group code in a cell; the column
     headings above it and the row labels beside it say material, density, amperage, width..."""
+
+    smart_matches = find_smart_table_matches(values, sheet_name, base, group)
+    if smart_matches is not None:
+        return smart_matches
+
+    labeled_matches = find_labeled_table_matches(values, sheet_name, base, group)
+    if labeled_matches is not None:
+        return labeled_matches
 
     dimension_matches = find_dimension_grid_matches(values, sheet_name, base, group)
     if dimension_matches is not None:
@@ -1354,6 +1463,7 @@ def find_grid_group_matches(values, sheet_name, base, group):
             matches.append(GridMatch(
                 sheet_name, tuple(headers), section,
                 tuple(t for index, t in enumerate(row_texts) if t and index < column), titles, text,
+                required_parameters=("Width (Wide)",) if normalize_code(section).startswith("CROSSBUSMOUNTING") else (),
             ))
 
     return matches
@@ -1443,6 +1553,13 @@ def description_parameter_values(description):
         elif short:
             found["Amperage"] = f"{short.group(1)}00-{short.group(2)}"
 
+    height = re.search(r'(\d+)\s*"?\s*(?:HIGH|HEIGHT|H)\b', text)
+    if height:
+        found["Height"] = height.group(1)
+    seismic = re.search(r"\b(NON[- ]?SEISMIC|SEISMIC)\b", text)
+    if seismic:
+        found["Seismic/Non-Seismic"] = "NON-SEISMIC" if seismic.group(1).startswith("NON") else "SEISMIC"
+
     return found
 
 
@@ -1459,6 +1576,7 @@ def _grid_value_matches(derived, wanted):
 
     def clean(text):
         text = re.sub(r"\s*MIN$", "", _cell_text(text).strip())
+        text = re.sub(r"\s+ONLY$", "", text)
         return MATERIAL_ALIASES.get(text, text)
 
     wanted = clean(wanted)
@@ -1553,14 +1671,54 @@ def select_grid_tables(matches, common_parameters, description=""):
     return [], "Table selection unresolved: save Bus Position or Part Name before matching a mounting group."
 
 
+def workbook_migration(sheets):
+    for _sheet_name, rows in sheets:
+        for row in rows[:8]:
+            for value in row:
+                text = _cell_text(value)
+                target = re.search(r"MAINTAINED ON SPREADSHEET\s*:\s*(.+?\.XLSX?)\b", text)
+                if target:
+                    return target.group(1), text
+                if "OBSOLET" in text or "OBSOLTED" in text:
+                    return "", text
+    return None
+
+
 def find_grid_group(sheets, base, wanted, common_parameters=None, description=""):
     """(group, message) for grid-layout family sheets: the one group whose table agrees with
     every job value it can be compared on ({parameter name: value})."""
 
+    migration = workbook_migration(sheets)
+    if migration is not None:
+        return "", f"Workbook retired: {migration[1]}. Resolve the current workbook through Index2."
     matches = [
         match for sheet_name, values in sheets
         for match in find_grid_group_matches(values, sheet_name, base, "")
     ]
+    wanted = dict(wanted)
+    selector_text = description.upper()
+    for name in ("Test Plug", "Table Row", "Metering Configuration", "Door Vents"):
+        saved = (common_parameters or {}).get(name, ())
+        if isinstance(saved, str):
+            saved = (saved,)
+        if len(saved) > 1:
+            return "", f"Table selection unresolved: conflicting saved {name} values."
+        if len(saved) == 1:
+            wanted[name] = saved[0]
+    if re.search(r"\b(?:W/O|WITHOUT|NO)\s+TEST\s+PLUG\b", selector_text):
+        wanted["Test Plug"] = "WITHOUT"
+    elif re.search(r"\bWITH\s+TEST\s+PLUG\b", selector_text):
+        wanted["Test Plug"] = "WITH"
+    row_text = normalize_code(wanted.get("Table Row") or wanted.get("Metering Configuration") or wanted.get("Door Vents") or description)
+    row_options = {
+        value for match in matches for name, value in match.axis_values
+        if name == "Table Row" and normalize_code(value) in row_text
+    }
+    if row_options:
+        longest = max(len(normalize_code(value)) for value in row_options)
+        rows = [value for value in row_options if len(normalize_code(value)) == longest]
+        if len(rows) == 1:
+            wanted["Table Row"] = rows[0]
     matches, selection_error = select_grid_tables(matches, common_parameters or {}, description)
     if selection_error:
         return "", selection_error
@@ -1574,15 +1732,26 @@ def find_grid_group(sheets, base, wanted, common_parameters=None, description=""
 
     wanted = {normalize_code(name): value for name, value in wanted.items() if value}
     groups = {}
+    missing = set()
 
     for (group, sheet_name, section), matches in by_table.items():
         for match in matches:
             derived = {normalize_code(name): value for name, value in grid_parameter_values(match).items()}
+            absent = [name for name in match.required_parameters if not wanted.get(normalize_code(name))]
+            if absent:
+                missing.update(absent)
+                continue
             compared = [name for name in wanted if name in derived]
             if compared and all(_grid_value_matches(derived[name], wanted[name]) for name in compared):
-                groups.setdefault(group, set()).add(f"{sheet_name} / {section}" if section else sheet_name)
+                evidence = f"{sheet_name} / {section}" if section else sheet_name
+                if match.required_parameters:
+                    inputs = ", ".join(f"{name}={wanted[normalize_code(name)]}" for name in match.required_parameters)
+                    evidence += f" [inputs: {inputs}]"
+                groups.setdefault(group, set()).add(evidence)
 
     if not groups:
+        if missing:
+            return "", f"Missing required table inputs: {', '.join(sorted(missing))}."
         return "", "No grid group matches the job parameter values."
     if len(groups) > 1:
         return "", f"Multiple groups match: {', '.join(sorted(groups))}."
@@ -1904,10 +2073,12 @@ class ExcelComSession:
             "; ".join(result.source for result in results),
         )
 
-    def get_group_tables(self, link_target):
+    def get_group_tables(self, link_target, _visited=()):
         """Group-bearing tables from every active sheet of the family workbook, cached."""
 
         key = link_target.upper()
+        if key in _visited:
+            raise RuntimeError("Replacement workbook cycle detected.")
 
         if key not in self._group_tables:
             workbook = self.get_family_workbook(link_target)
@@ -1920,6 +2091,36 @@ class ExcelComSession:
                 if isinstance(values, tuple):
                     sheets.append((sheet.Name, values))
                     tables.extend(WorkbookParser.extract_tables(values, sheet.Name))
+            migration = workbook_migration(sheets)
+            if not any(any(_cell_text(value) for row in rows for value in row) for _name, rows in sheets):
+                raise RuntimeError(f"{workbook.Name} has no readable active table data. Cannot determine a group.")
+            if migration is not None:
+                target, notice = migration
+                if not target:
+                    raise RuntimeError(f"Workbook retired: {notice}. Current smart workbook must be identified in Index2.")
+                index = self._get_index2_workbook()
+                target_name = normalize_code(os.path.splitext(link_file_name(target))[0])
+                candidates = set()
+                for hyperlink in index.Worksheets(1).Hyperlinks:
+                    if hyperlink.Range.Column != 5:
+                        continue
+                    name = normalize_code(os.path.splitext(str(hyperlink.Range.Value or ""))[0])
+                    address = str(hyperlink.Address or "")
+                    if name == target_name or normalize_code(os.path.splitext(link_file_name(address))[0]) == target_name:
+                        candidates.add(address)
+                if len(candidates) != 1:
+                    raise RuntimeError(f"Replacement {target} has no unique Index2 link. {notice}")
+                replacement = next(iter(candidates))
+                if replacement.startswith("../"):
+                    from urllib.parse import urljoin
+                    replacement = urljoin(str(index.Path).rstrip("/") + "/", replacement)
+                replacement_tables = self.get_group_tables(replacement, (*_visited, key))
+                self._group_tables[key] = replacement_tables
+                self._sheet_values[key] = tuple(
+                    (f"{link_file_name(replacement)} / {sheet_name}", rows)
+                    for sheet_name, rows in self._sheet_values[replacement.upper()]
+                )
+                return replacement_tables
             self._group_tables[key] = tuple(tables)
             self._sheet_values[key] = tuple(sheets)
 
@@ -2054,14 +2255,14 @@ class AuditReviewDemo(QMainWindow):
         root.setSpacing(0)
         sidebar = QFrame()
         sidebar.setObjectName("sidebar")
-        sidebar.setFixedWidth(188)
+        sidebar.setFixedWidth(208)
         navigation = QVBoxLayout(sidebar)
-        navigation.setContentsMargins(18, 28, 18, 22)
+        navigation.setContentsMargins(18, 22, 18, 18)
         navigation.setSpacing(10)
         brand = QLabel("MCOE\nAUDIT")
         brand.setObjectName("brand")
         navigation.addWidget(brand)
-        navigation.addSpacing(24)
+        navigation.addSpacing(12)
         self.navigation_group = QButtonGroup(self)
         for index, (title, icon) in enumerate((
             ("Checklist", QStyle.StandardPixmap.SP_FileDialogDetailedView),
@@ -2075,7 +2276,38 @@ class AuditReviewDemo(QMainWindow):
             navigation.addWidget(button)
         self.navigation_group.idClicked.connect(self.main_tabs.setCurrentIndex)
         self.main_tabs.currentChanged.connect(lambda index: self.navigation_group.button(index).setChecked(True))
-        navigation.addStretch()
+        navigation.addSpacing(12)
+        log_header = QHBoxLayout()
+        log_title = QLabel("ACTIVITY LOG")
+        log_title.setObjectName("sidebarCaption")
+        log_header.addWidget(log_title, 1)
+        self.clear_log_button = QPushButton()
+        self.clear_log_button.setObjectName("clearLog")
+        self.clear_log_button.setIcon(self.style().standardIcon(QStyle.StandardPixmap.SP_TrashIcon))
+        self.clear_log_button.setToolTip("Clear activity log")
+        self.clear_log_button.setAccessibleName("Clear activity log")
+        self.clear_log_button.setFixedSize(26, 26)
+        log_header.addWidget(self.clear_log_button)
+        navigation.addLayout(log_header)
+        self.automation_activity = QLabel("Idle")
+        self.automation_activity.setObjectName("activityStatus")
+        self.automation_activity.setTextFormat(Qt.TextFormat.PlainText)
+        self.automation_activity.setWordWrap(True)
+        self.automation_activity.setMinimumWidth(0)
+        self.automation_activity.setMaximumHeight(90)
+        navigation.addWidget(self.automation_activity)
+        self.automation_log = QPlainTextEdit()
+        self.automation_log.setObjectName("automationLog")
+        self.automation_log.setAccessibleName("Automation activity log")
+        self.automation_log.setReadOnly(True)
+        self.automation_log.setPlaceholderText("Live updates will appear here\nwhen automation starts.")
+        self.automation_log.setMaximumBlockCount(1000)
+        self.automation_log.setMinimumSize(0, 100)
+        self.automation_log.setMaximumHeight(220)
+        self.automation_log.setWordWrapMode(QTextOption.WrapMode.WrapAnywhere)
+        self.automation_log.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        self.clear_log_button.clicked.connect(self.automation_log.clear)
+        navigation.addWidget(self.automation_log, 1)
         scope_title = QLabel("AUDIT SCOPE")
         scope_title.setObjectName("sidebarCaption")
         navigation.addWidget(scope_title)
@@ -2083,6 +2315,7 @@ class AuditReviewDemo(QMainWindow):
         navigation.addWidget(self.test_scope_checkbox)
         self.enclosure_label.setWordWrap(True)
         navigation.addWidget(self.enclosure_label)
+        navigation.addStretch()
         root.addWidget(sidebar)
 
         workspace = QWidget()
@@ -2090,9 +2323,15 @@ class AuditReviewDemo(QMainWindow):
         content.setContentsMargins(24, 24, 24, 16)
         content.setSpacing(14)
         heading_row = QHBoxLayout()
+        heading_text = QVBoxLayout()
+        heading_text.setSpacing(2)
+        eyebrow = QLabel("ENGINEERING / QUALITY ASSURANCE")
+        eyebrow.setObjectName("eyebrow")
+        heading_text.addWidget(eyebrow)
         heading = QLabel("Job Review")
         heading.setObjectName("pageTitle")
-        heading_row.addWidget(heading)
+        heading_text.addWidget(heading)
+        heading_row.addLayout(heading_text)
         heading_row.addStretch()
         self.browse_pdf_btn.setText("Job Folder")
         self.browse_pdf_btn.setIcon(self.style().standardIcon(QStyle.StandardPixmap.SP_DirOpenIcon))
@@ -2109,10 +2348,16 @@ class AuditReviewDemo(QMainWindow):
         summary = QFrame()
         summary.setObjectName("summary")
         metrics = QHBoxLayout(summary)
-        metrics.setContentsMargins(0, 14, 0, 14)
+        metrics.setContentsMargins(0, 0, 0, 0)
+        metrics.setSpacing(10)
         self.summary_labels = {}
         for key, title in (("total", "ASSEMBLIES"), ("mapped", "MAPPED"), ("PASS", "PASS"), ("FAIL", "FAIL"), ("UNRESOLVED", "UNRESOLVED")):
-            metric = QVBoxLayout()
+            card = QFrame()
+            card.setObjectName("card" + key)
+            card.setProperty("metricCard", True)
+            metric = QVBoxLayout(card)
+            metric.setContentsMargins(14, 10, 14, 10)
+            metric.setSpacing(3)
             number = QLabel("0")
             number.setObjectName("metric" + key)
             number.setProperty("metric", True)
@@ -2120,7 +2365,7 @@ class AuditReviewDemo(QMainWindow):
             caption.setObjectName("metricCaption")
             metric.addWidget(number)
             metric.addWidget(caption)
-            metrics.addLayout(metric, 1)
+            metrics.addWidget(card, 1)
             self.summary_labels[key] = number
         content.addWidget(summary)
 
@@ -2130,9 +2375,11 @@ class AuditReviewDemo(QMainWindow):
         self.audit_search = QLineEdit()
         self.audit_search.setPlaceholderText("Search assemblies, descriptions, codes...")
         self.audit_search.setClearButtonEnabled(True)
+        self.audit_search.setAccessibleName("Search audit assemblies")
         self.audit_search.setMinimumWidth(180)
         self.status_filter = QComboBox()
         self.status_filter.addItems(["All statuses", "PASS", "FAIL", "UNRESOLVED"])
+        self.status_filter.setAccessibleName("Filter audit status")
         self.status_filter.setMinimumWidth(138)
         self.parameter_toggle = QCheckBox("Parameter columns")
         toolbar.addWidget(self.audit_search, 1)
@@ -2170,6 +2417,13 @@ class AuditReviewDemo(QMainWindow):
         self.status_filter.currentIndexChanged.connect(self._apply_audit_filters)
         self.parameter_toggle.toggled.connect(self._toggle_parameter_columns)
         self.main_tabs.tabBar().hide()
+        self._tab_opacity = QGraphicsOpacityEffect(self.main_tabs)
+        self.main_tabs.setGraphicsEffect(self._tab_opacity)
+        self._tab_animation = QPropertyAnimation(self._tab_opacity, b"opacity", self)
+        self._tab_animation.setDuration(220)
+        self._tab_animation.setEasingCurve(QEasingCurve.Type.OutCubic)
+        self.main_tabs.currentChanged.connect(self._animate_workspace)
+        self._workspace_revealed = False
         content.addWidget(self.main_tabs, 1)
         self.scan_status.setWordWrap(True)
         self.scan_status.setMaximumHeight(54)
@@ -2184,6 +2438,18 @@ class AuditReviewDemo(QMainWindow):
         old_central.deleteLater()
         self._configure_columns(self._parameter_columns)
         self.update_progress()
+
+    def showEvent(self, event):
+        super().showEvent(event)
+        if not self._workspace_revealed:
+            self._workspace_revealed = True
+            self._animate_workspace()
+
+    def _animate_workspace(self, _index=None):
+        self._tab_animation.stop()
+        self._tab_animation.setStartValue(0.65)
+        self._tab_animation.setEndValue(1.0)
+        self._tab_animation.start()
 
     def _toggle_parameter_columns(self):
         for column in range(4, 4 + self._parameter_columns):
@@ -2328,6 +2594,12 @@ class AuditReviewDemo(QMainWindow):
 
         self.scan_status.setText(text)
         self.scan_status.setToolTip(text)
+        if hasattr(self, "automation_log"):
+            self.automation_activity.setText(text)
+            self.automation_activity.setToolTip(text)
+            scrollbar = self.automation_log.verticalScrollBar()
+            self.automation_log.appendPlainText(f"[{time.strftime('%H:%M:%S')}] {text}")
+            scrollbar.setValue(scrollbar.maximum())
         QApplication.processEvents()
 
     # ------------------------------------------------------------------
@@ -2384,6 +2656,9 @@ class AuditReviewDemo(QMainWindow):
 
         try:
             self._run_automation(self._pending_folder)
+        except Exception as exc:
+            self._set_status(f"Automation failed: {type(exc).__name__}: {exc}")
+            raise
         finally:
             QApplication.restoreOverrideCursor()
             self.browse_pdf_btn.setEnabled(True)
@@ -2529,6 +2804,7 @@ class AuditReviewDemo(QMainWindow):
                 dwg_failures.append(f"{name}: {type(exc).__name__}: {exc}")
 
         for source_text, source_name in parameter_sources:
+            self._parameter_repository.merge_sources(extract_table_selectors(source_text, source_name))
             for number, requirements in section_bus_requirements(source_text, source_name).items():
                 self._section_bus_requirements.setdefault(number, ParameterRepository()).merge_sources(requirements)
 
@@ -2801,9 +3077,6 @@ class AuditReviewDemo(QMainWindow):
 
         if tables_error:
             return ValidationEngine.compare(expected, "", tables_error)
-        if mapping is None:
-            return ValidationEngine.compare(expected, "", "No Code Wise Parameters row for this family.")
-
         scoped = assembly_bus_requirements(getattr(self, "_section_bus_requirements", {}), section_number, description)
         if scoped and scoped.has_conflict("Heat Test/Density"):
             sources = "; ".join(f"{value}: {source}" for value, source in scoped.get_entries("Heat Test/Density"))
@@ -2815,7 +3088,7 @@ class AuditReviewDemo(QMainWindow):
             from_description["Material"] = job_material  # the job's plating is more specific than 'CU'
         by_key = {normalize_code(name): value for name, value in from_description.items()}
         values = {}
-        for name in mapping.parameters:
+        for name in mapping.parameters if mapping else ():
             if not name or ConfigurationRepository._normalized(name) in ASSEMBLY_LABELS:
                 continue
             value = self._resolved_value(style_number, name, width, depth) or by_key.get(normalize_code(name), "")
@@ -2825,18 +3098,29 @@ class AuditReviewDemo(QMainWindow):
         if scoped:
             values["Heat Test/Density"] = scoped.get_parameter("Heat Test/Density")
 
-        if not values and not from_description:
-            return ValidationEngine.compare(expected, "", "No checklist parameter values were found in the job files.")
-
         link_target = self._assembly_links.get(style_number)
         try:
             sheets = self._excel_com.get_sheet_values(link_target) if link_target else ()
-        except Exception:
-            sheets = ()
+        except Exception as exc:
+            return ValidationEngine.compare(expected, "", f"Workbook data unavailable: {exc}")
+        matches = [match for sheet_name, rows in sheets for match in find_grid_group_matches(rows, sheet_name, base, "")]
+        needed = {name for match in matches for name in match.required_parameters}
+        needed.update(("Metering Configuration", "Door Vents"))
+        for name in needed:
+            repository = getattr(self, "_parameter_repository", None)
+            if repository and repository.has_conflict(name):
+                return ValidationEngine.compare(expected, "", f"Conflicting job values for required table input: {name}.")
+            value = self._resolved_value(style_number, name, width, depth) or from_description.get(name, "")
+            if value and name not in values:
+                values[name] = value
+        if width:
+            values.setdefault("Width (Wide)", width)
+        if depth:
+            values.setdefault("Depth", depth)
         actual, message = find_grid_group(
             sheets, base, {**from_description, **values}, self.parameter_variables.values, description,
         )
-        if not actual and not message.startswith("Table selection"):
+        if not actual and message == "Base not found in grid-layout sheets.":
             table_group, table_message = GroupDeterminationEngine.identify_group(tables, base, values) if values else ("", "")
             if table_group or message == "Base not found in grid-layout sheets.":
                 actual, message = table_group, table_message or message
@@ -2926,7 +3210,13 @@ class AuditReviewDemo(QMainWindow):
                 else f"Family not resolved from Index2: {result.message}"
             )
 
-        validation = self.validate_assembly(style_number, mapping, width, depth, tables, tables_error, description, section_number)
+        description_values = description_parameter_values(description)
+        validation = self.validate_assembly(
+            style_number, mapping,
+            structure_width or description_values.get("Width (Wide)", ""),
+            structure_depth or description_values.get("Depth", ""),
+            tables, tables_error, description, section_number,
+        )
         self._validation_results[key] = validation
 
         item = QTreeWidgetItem(
@@ -2945,6 +3235,11 @@ class AuditReviewDemo(QMainWindow):
         item.setCheckState(0, Qt.CheckState.Unchecked)
 
         self.checkbox_items[key] = item
+        location = f"Structure {section_number}: " if section_number is not None else ""
+        activity = f"{location}{style_number} - {validation.status} (Expected {validation.expected_group or '-'}, Actual {validation.actual_group or '-'})"
+        if validation.status != "PASS" and validation.message:
+            activity += f". {validation.message}"
+        self._set_status(activity)
 
     def update_progress(self):
 
@@ -2970,6 +3265,7 @@ class AuditReviewDemo(QMainWindow):
 
     def closeEvent(self, event):
 
+        self._tab_animation.stop()
         self._excel_com.close()
         super().closeEvent(event)
 
@@ -2980,46 +3276,62 @@ class AuditReviewDemo(QMainWindow):
     def _build_stylesheet(self):
 
         return """
-        QMainWindow, QWidget { background: #f7f9fc; color: #243347; font-size: 13px; }
-        QFrame#sidebar { background: #205bea; border: none; }
+        QMainWindow, QWidget { background: #f3f6fc; color: #26354b; font-size: 13px; }
+        QFrame#sidebar { background: qlineargradient(x1:0, y1:0, x2:0, y2:1, stop:0 #172b50, stop:1 #0c172e); border: none; }
         QFrame#sidebar QLabel, QFrame#sidebar QCheckBox { background: transparent; color: #ffffff; }
         QFrame#sidebar QCheckBox::indicator { width: 12px; height: 12px; border: 1px solid #ffffff; border-radius: 2px; background: transparent; }
         QFrame#sidebar QCheckBox::indicator:checked { width: 8px; height: 8px; border: 3px solid #ffffff; background: #174dc9; }
-        QLabel#brand { font-family: 'Bahnschrift'; font-size: 27px; font-weight: 700; padding-bottom: 14px; }
-        QLabel#sidebarCaption { font-size: 11px; color: #dce8ff; }
-        QFrame#sidebar QPushButton { background: transparent; color: #ffffff; border: none; text-align: left; padding: 12px; }
-        QFrame#sidebar QPushButton:hover { background: #174dc9; }
-        QFrame#sidebar QPushButton:checked { background: #ffffff; color: #184cc1; }
-        QLabel#pageTitle { font-family: 'Bahnschrift'; font-size: 25px; font-weight: 600; color: #172c42; }
-        QLabel#jobLabel { color: #64748b; padding-bottom: 3px; }
-        QFrame#summary { border-top: 1px solid #dce3ed; border-bottom: 1px solid #dce3ed; }
+        QLabel#brand { font-family: 'Bahnschrift'; font-size: 27px; font-weight: 700; padding-bottom: 6px; }
+        QFrame#sidebar QLabel#sidebarCaption { font-size: 10px; font-weight: 600; color: #a8bddf; }
+        QFrame#sidebar QLabel#activityStatus { color: #c4d4ee; font-size: 11px; }
+        QPlainTextEdit#automationLog { background: #101e37; color: #dbe8ff; border: 1px solid #314563; border-radius: 8px; padding: 7px; font-size: 11px; }
+        QFrame#sidebar QPushButton#clearLog { padding: 0; min-height: 0; border: 1px solid #506586; border-radius: 6px; }
+        QFrame#sidebar QPushButton { background: transparent; color: #dbe8ff; border: 1px solid transparent; border-radius: 8px; text-align: left; padding: 10px; }
+        QFrame#sidebar QPushButton:hover { background: #263d60; border-color: #435e88; }
+        QFrame#sidebar QPushButton:checked { background: #356bf0; color: #ffffff; border-color: #5786f6; }
+        QLabel#eyebrow { font-size: 10px; font-weight: 600; color: #647a9c; }
+        QLabel#pageTitle { font-family: 'Bahnschrift'; font-size: 28px; font-weight: 600; color: #172c42; }
+        QLabel#jobLabel { color: #637692; padding: 8px 12px; background: #e9eff9; border-radius: 7px; }
+        QFrame#summary { background: transparent; border: none; }
+        QFrame[metricCard="true"] { background: #ffffff; border: 1px solid #dfe7f3; border-radius: 10px; }
+        QFrame#cardPASS { background: #effaf5; border-color: #ccebdc; }
+        QFrame#cardFAIL { background: #fff3f3; border-color: #f3d6d9; }
+        QFrame#cardUNRESOLVED { background: #fff9ed; border-color: #efdfbc; }
+        QFrame[metricCard="true"] QLabel { background: transparent; }
         QLabel[metric="true"] { font-family: 'Bahnschrift'; font-size: 28px; font-weight: 600; }
+        QLabel#metrictotal, QLabel#metricmapped { color: #356bf0; }
         QLabel#metricPASS { color: #14804a; }
         QLabel#metricFAIL { color: #c13342; }
         QLabel#metricUNRESOLVED { color: #a66a08; }
         QLabel#metricCaption { font-size: 11px; color: #68788b; }
         QGroupBox, QTabWidget::pane { border: none; margin: 0; padding: 0; }
-        QPushButton { background: #ffffff; color: #254d87; border: 1px solid #cdd9ea; border-radius: 5px; padding: 8px 14px; font-weight: 600; min-height: 18px; }
+        QPushButton { background: #ffffff; color: #254d87; border: 1px solid #cdd9ea; border-radius: 8px; padding: 8px 14px; font-weight: 600; min-height: 18px; }
         QPushButton:hover { background: #eaf1ff; border-color: #83a7ec; }
         QPushButton:pressed { background: #d9e6ff; }
         QPushButton:disabled { background: #edf0f5; color: #8b99aa; border-color: #dde3ec; }
-        QPushButton#start_btn { background: #16834a; color: #ffffff; border-color: #16834a; }
-        QPushButton#start_btn:hover { background: #106c3c; }
-        QPushButton#start_btn:disabled { background: #dce9e1; color: #7a9383; border-color: #dce9e1; }
-        QLineEdit, QComboBox { background: #ffffff; border: 1px solid #cdd9ea; border-radius: 4px; padding: 8px; min-height: 18px; }
+        QPushButton#start_btn { background: #356bf0; color: #ffffff; border-color: #356bf0; }
+        QPushButton#start_btn:hover { background: #2454ca; }
+        QPushButton#start_btn:disabled { background: #e0e8f9; color: #7184a7; border-color: #d3ddf0; }
+        QPushButton:focus { border-color: #356bf0; }
+        QLineEdit, QComboBox { background: #ffffff; border: 1px solid #cdd9ea; border-radius: 8px; padding: 8px; min-height: 18px; }
         QLineEdit:focus, QComboBox:focus { border: 1px solid #205bea; }
         QComboBox::drop-down { border: none; width: 24px; }
         QComboBox QAbstractItemView { background: #ffffff; selection-background-color: #e7efff; selection-color: #173968; }
         QCheckBox { spacing: 7px; }
-        QTreeWidget { background: #ffffff; alternate-background-color: #f8fafc; border: 1px solid #dce3ed; border-radius: 5px; outline: none; selection-background-color: #e3edff; selection-color: #143563; }
+        QTreeWidget { background: #ffffff; alternate-background-color: #f8fafc; border: 1px solid #dce3ed; border-radius: 9px; outline: none; selection-background-color: #e3edff; selection-color: #143563; }
         QTreeWidget::item { min-height: 31px; padding: 3px 5px; border-bottom: 1px solid #f0f3f7; }
         QTreeWidget::item:hover { background: #f0f5ff; }
         QTreeWidget::item:selected { background: #e3edff; color: #143563; }
         QHeaderView::section { background: #e9f0fc; color: #315274; padding: 10px 6px; border: none; border-right: 1px solid #dce5f3; font-weight: 600; }
-        QPlainTextEdit { background: #ffffff; border: 1px solid #dce3ed; border-radius: 5px; padding: 10px; selection-background-color: #dce9ff; }
+        QPlainTextEdit { background: #ffffff; border: 1px solid #dce3ed; border-radius: 9px; padding: 10px; selection-background-color: #dce9ff; }
+        QScrollBar:vertical { background: transparent; width: 10px; margin: 2px; }
+        QScrollBar::handle:vertical { background: #aabbd4; min-height: 28px; border-radius: 3px; }
+        QScrollBar::handle:vertical:hover { background: #7796c5; }
+        QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical { height: 0; }
+        QScrollBar::add-page:vertical, QScrollBar::sub-page:vertical { background: transparent; }
         QLabel#scan_status { color: #67758a; font-size: 11px; }
         QProgressBar { background: #e8edf4; color: #29455f; border: none; border-radius: 4px; text-align: center; font-size: 11px; }
-        QProgressBar::chunk { background: #9ddbb9; border-radius: 4px; }
+        QProgressBar::chunk { background: qlineargradient(x1:0, y1:0, x2:1, y2:0, stop:0 #8eb8ff, stop:1 #78d8c0); border-radius: 4px; }
         QToolTip { background: #ffffff; color: #243347; border: 1px solid #cdd9ea; padding: 6px; }
         """
 

@@ -50,6 +50,77 @@ class AuditWorkspaceTests(unittest.TestCase):
         self.assertIn("Validation evidence", self.window.row_details.toPlainText())
         self.assertIn("Width = 30", self.window.row_details.toPlainText())
 
+    def test_workspace_animation_finishes_and_restarts_on_navigation(self):
+        window = self.window
+        window.show()
+        QA2.QApplication.processEvents()
+        self.assertTrue(window._workspace_revealed)
+        window._tab_animation.setCurrentTime(window._tab_animation.duration())
+        self.assertEqual(window._tab_opacity.opacity(), 1.0)
+        window.navigation_group.button(1).click()
+        self.assertEqual(window.main_tabs.currentIndex(), 1)
+        self.assertLess(window._tab_opacity.opacity(), 1.0)
+        window._tab_animation.setCurrentTime(window._tab_animation.duration())
+        self.assertEqual(window._tab_opacity.opacity(), 1.0)
+
+    def test_status_cards_and_scope_fit_at_minimum_window_size(self):
+        window = self.window
+        window.resize(960, 640)
+        window.show()
+        QA2.QApplication.processEvents()
+        for key, label in window.summary_labels.items():
+            self.assertEqual(label.parentWidget().objectName(), "card" + key)
+            self.assertGreaterEqual(label.width(), label.sizeHint().width())
+        sidebar = window.test_scope_checkbox.parentWidget()
+        for widget in (window.automation_log, window.test_scope_checkbox, window.enclosure_label):
+            self.assertTrue(sidebar.rect().contains(widget.geometry()))
+        self.assertLess(window.automation_log.geometry().bottom(), window.test_scope_checkbox.y())
+
+    def test_activity_log_tracks_status_and_limits_history(self):
+        window = self.window
+        self.assertTrue(window.automation_log.isReadOnly())
+        self.assertEqual(window.automation_log.maximumBlockCount(), 1000)
+        window._set_status("Reading Index2...")
+        window._set_status("Opening Enclosure.xlsx...")
+        text = window.automation_log.toPlainText()
+        self.assertRegex(text, r"\[\d{2}:\d{2}:\d{2}\] Reading Index2")
+        self.assertLess(text.index("Reading Index2"), text.index("Opening Enclosure"))
+        self.assertEqual(window.automation_activity.text(), "Opening Enclosure.xlsx...")
+        self.assertEqual(window.scan_status.text(), window.automation_activity.text())
+        window.automation_log.setMaximumBlockCount(2)
+        window._set_status("Validation complete")
+        self.assertNotIn("Reading Index2", window.automation_log.toPlainText())
+        window.clear_log_button.click()
+        self.assertEqual(window.automation_log.toPlainText(), "")
+        self.assertEqual(window.automation_activity.text(), "Validation complete")
+
+    def test_activity_log_scrolls_to_latest_message(self):
+        window = self.window
+        window.show()
+        QA2.QApplication.processEvents()
+        for index in range(100):
+            window._set_status(f"Log message {index}")
+
+        scrollbar = window.automation_log.verticalScrollBar()
+        self.assertGreater(scrollbar.maximum(), 0)
+        scrollbar.setValue(0)
+        window._set_status("Latest log message")
+
+        self.assertEqual(scrollbar.value(), scrollbar.maximum())
+
+    def test_activity_log_does_not_push_scope_controls_out_of_view(self):
+        window = self.window
+        window.resize(960, 640)
+        window.show()
+        QA2.QApplication.processEvents()
+
+        self.assertLessEqual(window.automation_log.height(), 220)
+        self.assertTrue(window.test_scope_checkbox.isVisible())
+        self.assertTrue(window.test_scope_checkbox.isEnabled())
+        previous_state = window.test_scope_checkbox.isChecked()
+        window.test_scope_checkbox.click()
+        self.assertNotEqual(window.test_scope_checkbox.isChecked(), previous_state)
+
     def test_section_requirement_is_used_in_display_and_comparison(self):
         window = self.window
         window._code_mappings = QA2.parse_code_mappings((
@@ -197,6 +268,76 @@ class GroupValidationTests(unittest.TestCase):
 
 
 class WorkbookValueTests(unittest.TestCase):
+    def test_table_selector_labels_retain_source_and_conflicts(self):
+        repository = QA2.extract_table_selectors("NG Drawout: No\nStructure Material: Galvanized (Painted)\nTest Plug: WITH", "drawing.pdf page 2")
+        self.assertEqual(repository.get_parameter("NG Drawout"), "No")
+        self.assertEqual(repository.get_entries("Structure Material")[0][1], "drawing.pdf page 2")
+        repository.merge_sources(QA2.extract_table_selectors("NG Drawout: Yes", "other drawing"))
+        self.assertTrue(repository.has_conflict("NG Drawout"))
+
+    def test_recognized_missing_inputs_do_not_use_conventional_fallback(self):
+        sheets = (("WCVTBARA", (("REF. - 6552C34",), ("DEPTH", "GROUP"), ("36D", "G04"))),)
+        window = SimpleNamespace(
+            parameter_variables=QA2.ExcelParameterVariables({}),
+            _resolved_value=lambda *args: "", _assembly_links={"6552C34G04": "barrier.xlsx"},
+            _excel_com=SimpleNamespace(get_sheet_values=lambda link: sheets),
+        )
+        with patch.object(QA2.GroupDeterminationEngine, "identify_group", return_value=("G04", "wrong fallback")) as fallback:
+            result = QA2.AuditReviewDemo.validate_assembly(window, "6552C34G04", None, "", "", (), "")
+        self.assertEqual(result.status, "UNRESOLVED")
+        self.assertIn("Depth", result.message)
+        fallback.assert_not_called()
+
+    def test_enclosure_smart_table_requires_all_inputs(self):
+        sheets = (("Enclosure.xlsx / Basic Structure - Type 1", (
+            ("INPUT", None, None, None, None, "OUTPUT", None, "REFERENCE INFORMATION"),
+            ("NG DRAWOUT", "STRUCTURE HEIGHT", "STRUCTURE WIDTH", "STRUCTURE DEPTH", "SEISMIC", "BASIC STRUCTURE"),
+            ("No", "90 Only", "36 Only", "30 Only", "Non-Seismic", "6575C01G22"),
+            ("No", "90 Only", "36 Only", "36 Only", "Non-Seismic", "6575C01G23"),
+        )),)
+        wanted = {"NG Drawout": "No", "Height": "90", "Width (Wide)": "36", "Depth": "30", "Seismic/Non-Seismic": "Non-Seismic", "NEMA 1/3R": "1"}
+        self.assertEqual(QA2.find_grid_group(sheets, "6575C01", wanted)[0], "G22")
+        for name in wanted:
+            incomplete = {key: value for key, value in wanted.items() if key != name}
+            actual, message = QA2.find_grid_group(sheets, "6575C01", incomplete)
+            self.assertEqual(actual, "")
+            self.assertIn(name, message)
+
+    def test_retired_workbooks_cannot_supply_groups(self):
+        for notice, target in (
+            ("Will be maintained on spreadsheet: ENCLOSURE.xls (Index 377)", "ENCLOSURE.XLS"),
+            ("All groups will be maintained on spreadsheet: Generic Cross Bus and Mountings.xls (Index 369)", "GENERIC CROSS BUS AND MOUNTINGS.XLS"),
+            ("THIS FILE IS OBSOLTED", ""),
+        ):
+            sheets = (("OLD", ((notice,), ("ASSY DWG", '36" WIDE'), ("42C2066", "G05"))),)
+            with self.subTest(notice=notice):
+                self.assertEqual(QA2.workbook_migration(sheets)[0], target)
+                actual, message = QA2.find_grid_group(sheets, "42C2066", {"Width (Wide)": "36"})
+                self.assertEqual(actual, "")
+                self.assertIn("retired", message)
+
+    def test_vertical_barrier_depth_table_requires_depth(self):
+        sheets = (("WCVTBARA", (
+            ("REF. - 6552C34",), ("DEPTH", "GROUP"),
+            ("24D", "G02"), ("30D", "G03"), ("36D", "G04"),
+        )),)
+        self.assertEqual(QA2.find_grid_group(sheets, "6552C34", {"Depth": "36"})[0], "G04")
+        self.assertIn("Depth", QA2.find_grid_group(sheets, "6552C34", {"Width (Wide)": "36"})[1])
+        self.assertEqual(QA2.find_grid_group(sheets, "6552C34", {"Depth": "40"})[0], "")
+
+    def test_metering_matrix_requires_width_row_and_test_plug(self):
+        sheets = (("DORMTGA", (
+            ("W/O TEST PLUG",), ("6555C79",), ("DESCRIPTION", "30W", "36W"),
+            ("AM & VM & SWITCHES", "G03", "G04"), (),
+            ("INDICATING LIGHT (1)", "G11", "G12"), (),
+            ("WITH TEST PLUG",), ("6555C79",), ("DESCRIPTION", "30W", "36W"),
+            ("AM & VM & SWITCHES", "G62", "G63"),
+        )),)
+        for text, actual in (("AM & VM & SWITCHES WITHOUT TEST PLUG", "G04"), ("AM & VM & SWITCHES WITH TEST PLUG", "G63")):
+            self.assertEqual(QA2.find_grid_group(sheets, "6555C79", {"Width (Wide)": "36"}, description=text)[0], actual)
+        self.assertEqual(QA2.find_grid_group(sheets, "6555C79", {"Width (Wide)": "36"})[0], "")
+        self.assertEqual(QA2.find_grid_group(sheets, "6555C79", {}, description="AM & VM & SWITCHES WITH TEST PLUG")[0], "")
+
     @staticmethod
     def wcctaux3_sheet():
         return (("WCCTAUX3", (
@@ -600,6 +741,45 @@ class IndexMappingTests(unittest.TestCase):
 
 
 class FamilyLayoutTests(unittest.TestCase):
+    def test_migration_uses_unique_index2_link_and_replacement_data(self):
+        old_rows = (("Will be maintained on spreadsheet: ENCLOSURE.xls (Index 377)",),)
+        current_rows = (("CURRENT DATA",),)
+        old = SimpleNamespace(Name="BASICSTR.xlsx", Worksheets=[SimpleNamespace(Name="Old", UsedRange=SimpleNamespace(Value=old_rows))])
+        current = SimpleNamespace(Name="Enclosure.xlsx", Worksheets=[SimpleNamespace(Name="Basic Structure - Type 1", UsedRange=SimpleNamespace(Value=current_rows))])
+        sheet = SimpleNamespace(Hyperlinks=[SimpleNamespace(
+            Range=SimpleNamespace(Column=5, Value="ENCLOSURE"), Address="Enclosure.xlsx",
+        )])
+        index = SimpleNamespace(Worksheets=lambda number: sheet)
+        session = QA2.ExcelComSession()
+        with patch.object(session, "get_family_workbook", side_effect=lambda link: old if link == "BASICSTR.xlsx" else current), \
+                patch.object(session, "_get_index2_workbook", return_value=index):
+            rows = session.get_sheet_values("BASICSTR.xlsx")
+        self.assertEqual(rows, (("Enclosure.xlsx / Basic Structure - Type 1", current_rows),))
+        self.assertNotIn("Old", rows[0][0])
+
+    def test_empty_and_circular_replacement_workbooks_are_rejected(self):
+        empty = SimpleNamespace(Name="Empty.xlsx", Worksheets=[SimpleNamespace(Name="Empty", UsedRange=SimpleNamespace(Value=None))])
+        session = QA2.ExcelComSession()
+        with patch.object(session, "get_family_workbook", return_value=empty):
+            with self.assertRaisesRegex(RuntimeError, "no readable active table data"):
+                session.get_group_tables("Empty.xlsx")
+        rows = (("Will be maintained on spreadsheet: CYCLE.xls (Index 1)",),)
+        cycle = SimpleNamespace(Name="CYCLE.xlsx", Worksheets=[SimpleNamespace(Name="Old", UsedRange=SimpleNamespace(Value=rows))])
+        sheet = SimpleNamespace(Hyperlinks=[SimpleNamespace(Range=SimpleNamespace(Column=5, Value="CYCLE"), Address="CYCLE.xlsx")])
+        with patch.object(session, "get_family_workbook", return_value=cycle), \
+                patch.object(session, "_get_index2_workbook", return_value=SimpleNamespace(Worksheets=lambda number: sheet)):
+            with self.assertRaisesRegex(RuntimeError, "cycle"):
+                session.get_group_tables("CYCLE.xlsx")
+
+    def test_ambiguous_migration_does_not_reuse_old_table(self):
+        rows = (("Will be maintained on spreadsheet: NEW.xls (Index 1)",), ("ASSY DWG", '36" WIDE'), ("42C2066", "G05"))
+        old = SimpleNamespace(Name="OLD.xlsx", Worksheets=[SimpleNamespace(Name="Old", UsedRange=SimpleNamespace(Value=rows))])
+        session = QA2.ExcelComSession()
+        index = SimpleNamespace(Worksheets=lambda number: SimpleNamespace(Hyperlinks=[]))
+        with patch.object(session, "get_family_workbook", return_value=old), patch.object(session, "_get_index2_workbook", return_value=index):
+            with self.assertRaisesRegex(RuntimeError, "no unique Index2 link"):
+                session.get_group_tables("OLD.xlsx")
+
     def lifting_table(self, depth="24D-48D", base="8708C64"):
         return (
             (f"{base} ASSEMBLY", None, None),
