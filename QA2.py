@@ -3,9 +3,12 @@ import os
 import re
 import shutil
 import time
+import json
 from io import BytesIO
 from dataclasses import dataclass, replace
-from urllib.parse import unquote, urlparse
+from datetime import datetime, time as datetime_time
+from functools import lru_cache
+from urllib.parse import unquote, urlparse, urljoin, urlunparse
 
 import checklist_parameters
 
@@ -25,15 +28,18 @@ from PyQt6.QtWidgets import (
     QMainWindow,
     QMessageBox,
     QPlainTextEdit,
+    QProgressBar,
     QPushButton,
+    QScrollArea,
     QTabWidget,
+    QTreeWidget,
     QTreeWidgetItem,
     QFileDialog,
     QVBoxLayout,
     QWidget,
 )
 from PyQt6.QtGui import QFont, QColor, QBrush, QTextOption
-from PyQt6.QtCore import QEasingCurve, QPropertyAnimation, Qt, QStringListModel
+from PyQt6.QtCore import QEasingCurve, QPropertyAnimation, QTimer, Qt, QStringListModel
 
 from PyQt6.uic import loadUi
 
@@ -78,8 +84,10 @@ except ImportError:
     Image = None
 
 try:
-    from openpyxl import load_workbook
+    from openpyxl import Workbook, load_workbook
+    from openpyxl.utils import get_column_letter
 except ImportError:
+    Workbook = None
     load_workbook = None
 
 try:
@@ -100,6 +108,8 @@ ASSEMBLY_ROW_RE = re.compile(r"^b\s+([^\s:]{2,25}):\s*(.+)$")
 
 # Local copy of the Index2 workbook, kept alongside this script.
 INDEX2_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "Index2.xlsx")
+METADATA_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "Metadata.xlsx")
+SEMANTIC_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "semantic_aliases.example.json")
 _CHECKLIST_NAME = "3. MCOE_Checklist.xlsx"
 _CHECKLIST_CANDIDATES = (
     os.path.join(os.path.dirname(os.path.abspath(__file__)), _CHECKLIST_NAME),
@@ -117,7 +127,7 @@ CHECKLIST_OPEN_TIMEOUT = 60
 CODE_SHEET_NAME = "Code Wise Parameters"
 COMMON_SHEET_NAMES = ("Comman parameters", "Common parameters")
 PARAMETER_COLUMN_COUNT = 5
-VALIDATION_COLORS = {"PASS": "#188038", "FAIL": "#d93025", "UNRESOLVED": "#b06000"}
+VALIDATION_COLORS = {"PASS": "#188038", "FAIL": "#d93025", "UNRESOLVED": "#b06000", "EXCLUDED": "#68788b"}
 
 # Live share link for Index2.xlsx. Raw COM Workbooks.Open() can't resolve this
 # (it creates a blank placeholder), so it's launched via the "ms-excel:ofe|u|"
@@ -145,9 +155,50 @@ STYLE_SUFFIX_RE = re.compile(r"^(.+?)([A-Za-z]+\d+)$")
 def link_file_name(link_target):
     """File name of an Index2 hyperlink, whether it is a full URL or relative."""
 
-    path = urlparse(link_target).path if "://" in link_target else link_target
+    path = urlparse(link_target).path if not os.path.isabs(link_target) else link_target
 
     return unquote(path).replace("\\", "/").rsplit("/", 1)[-1]
+
+
+def excel_document_url(folder, target):
+    """Turn Index2's browser-style :x:/r links into Excel document URLs."""
+    if os.path.isabs(target):
+        return target
+    url = urljoin(folder.rstrip("/") + "/", target)
+    parsed = urlparse(url)
+    path = re.sub(r"^/:[a-z]:/r/", "/", parsed.path, flags=re.I)
+    if re.search(r"\.xls[xmb]?$", path, re.I):
+        return urlunparse(parsed._replace(path=path, query="", fragment=""))
+    return url
+
+
+def snapshot_cell_value(value):
+    """Convert COM dates to serializable, timezone-free Excel wall-clock values."""
+    if isinstance(value, datetime):
+        return datetime(value.year, value.month, value.day, value.hour, value.minute, value.second, value.microsecond)
+    if isinstance(value, datetime_time):
+        return datetime_time(value.hour, value.minute, value.second, value.microsecond)
+    return value
+
+
+def normalize_excel_rows(values):
+    """Convert Excel COM's scalar, one-dimensional, or two-dimensional values to rows."""
+
+    if values is None:
+        return ()
+
+    if isinstance(values, (tuple, list)):
+        if not values:
+            return ()
+        if all(isinstance(row, (tuple, list)) for row in values):
+            rows = [tuple(row) for row in values]
+        else:
+            rows = [tuple(values)]
+    else:
+        rows = [(values,)]
+
+    column_count = max(map(len, rows), default=0)
+    return tuple(tuple(snapshot_cell_value(value) for value in row) + (None,) * (column_count - len(row)) for row in rows)
 
 
 # Checklist labels that the app can fill from the BOM/Index2/QuickPrint itself.
@@ -167,7 +218,11 @@ def split_style_number(style_number):
 
     match = STYLE_SUFFIX_RE.match(style_number)
 
-    if not match:
+    if not match or not (
+        any(character.isalpha() for character in match.group(1))
+        and any(character.isdigit() for character in match.group(1))
+        or match.group(1).isdigit() and len(match.group(1)) >= 6
+    ):
         return style_number, ""
 
     return match.group(1), match.group(2)
@@ -210,15 +265,12 @@ def build_index2_map_from_com(ws):
     Worksheet - used when there's no (or a stale) local Index2.xlsx copy."""
 
     used = ws.UsedRange
-    values = used.Value
+    values = normalize_excel_rows(used.Value)
     start_row = used.Row
     index_column = 11 - used.Column
 
     if not values or not 0 <= index_column < used.Columns.Count:
         return {}
-
-    if values and not isinstance(values[0], tuple):
-        values = (values,)
 
     row_to_link = {}
     for hl in ws.Hyperlinks:
@@ -245,6 +297,43 @@ def build_index2_map_from_com(ws):
                     mapping.setdefault(token, link_target)
 
     return mapping
+
+
+@dataclass(frozen=True)
+class Index2RootEntry:
+    root: str
+    row: int
+    family: str
+    link: str
+
+
+def read_index2_root_catalog(ws):
+    """Inventory column K independently of usable hyperlinks; retain duplicate source rows."""
+    used = ws.UsedRange
+    values = normalize_excel_rows(used.Value)
+    root_column, family_column = 11 - used.Column, 5 - used.Column
+    if not values or not 0 <= root_column < used.Columns.Count:
+        raise ValueError("Index2 column K is not available in the worksheet data.")
+    links = {
+        hyperlink.Range.Row: str(hyperlink.Address or "")
+        for hyperlink in ws.Hyperlinks if hyperlink.Range.Column == 5
+    }
+    entries = []
+    for offset, row in enumerate(values):
+        value = row[root_column]
+        if not isinstance(value, str):
+            continue
+        family = str(row[family_column] or "").strip() if 0 <= family_column < len(row) else ""
+        roots = set()
+        for token in value.split(","):
+            token = token.strip().upper()
+            base, suffix = split_style_number(token)
+            root = base if re.fullmatch(r"[GH]\d+", suffix) else token
+            if re.fullmatch(r"[A-Z0-9-]{6,}", root) and any(c.isdigit() for c in root):
+                roots.add(root)
+        row_number = used.Row + offset
+        entries.extend(Index2RootEntry(root, row_number, family, links.get(row_number, "")) for root in sorted(roots))
+    return tuple(entries)
 
 
 def _format_dim(value):
@@ -305,6 +394,41 @@ def com_grid_lookup(ws, base_number, suffix):
     return "", ""
 
 
+def snapshot_grid_lookup(sheet, base_number, suffix):
+    """Same BASICSTR grid lookup as the COM reader, using the captured cells."""
+    found = next((
+        cell for row in sheet.iter_rows() for cell in row
+        if cell.value is not None and str(cell.value).strip().upper() == base_number.strip().upper()
+    ), None)
+    if found is None:
+        return "", ""
+    top = bottom = found.row
+    for area in sheet.merged_cells.ranges:
+        if found.coordinate in area:
+            top, bottom = area.min_row, area.max_row
+            break
+    if top <= 1:
+        raise ValueError(f"{sheet.title}: {base_number} has no depth header row.")
+    depths = {}
+    blank_run = 0
+    column = found.column + 1
+    while blank_run < 3 and column - found.column < 100:
+        value = sheet.cell(top - 1, column).value
+        if value is None or not str(value).strip():
+            blank_run += 1
+        else:
+            blank_run = 0
+            depths[column] = _format_dim(value)
+        column += 1
+    for row in range(top, bottom + 1):
+        for column, depth in depths.items():
+            value = sheet.cell(row, column).value
+            if value is not None and str(value).strip().upper() == suffix.strip().upper():
+                width = sheet.cell(row, 2).value
+                return _format_dim(width) if width is not None else "", depth
+    return "", ""
+
+
 @dataclass(frozen=True)
 class DimensionResult:
     width: str = ""
@@ -324,6 +448,8 @@ class ConfigurationRecord:
     assembly_code: str
     category: str
     parameters: tuple[ParameterRule, ...]
+    manually_mapped: bool = False
+    checklist_row: int = 0
 
 
 @dataclass(frozen=True)
@@ -332,6 +458,8 @@ class CodeMapping:
     code: str
     parameters: tuple[str, ...]
     aliases: tuple[str, ...] = ()
+    manually_mapped: bool | None = None
+    checklist_row: int = 0
 
 
 def _clean_cells(row):
@@ -513,7 +641,10 @@ EXCEL_PARAMETER_PATTERNS = {
     "Voltage": _ECOE_VOLTAGE,
     "3/1 Phase": [r"\b(1|3)\s*-?\s*PHASE\b"],
     "3/4 Wire": [r"\b(3|4)\s*-?\s*WIRE\b"],
-    "Seismic/Non-Seismic": [r"\b(NON[- ]?SEISMIC|SEISMIC)\b"],
+    "Seismic/Non-Seismic": [
+        r"\b(?:SEISMIC(?:\s*/\s*NON[- ]?SEISMIC)?|STRUCTURE\s+RATING)\s*[:=]\s*(NON[- ]?SEISMIC|SEISMIC|YES|NO)\b",
+        r"^(NON[- ]?SEISMIC|SEISMIC)$",
+    ],
     "Heat Test/Density": [
         r"\bHEAT\s+TEST(?:\s*/\s*DENSITY)?\s*[:=\-]\s*(\d+(?:\.\d+)?\s*(?:DEG(?:REES)?\s*)?C?\b|[A-Z]{3,12}\b)",
         r"\bDENSITY\s*[:=\-]\s*(\d+(?:\.\d+)?\s*%?|[A-Z]{3,12}\b)",
@@ -591,6 +722,8 @@ def extract_excel_parameter_values(source_text):
                 value = ecoe_normalize(match).replace("ALUMINIUM", "ALUMINUM")
                 if parameter == "Material":
                     value = re.sub(r"\bCU\b", "COPPER", value)
+                elif parameter == "Seismic/Non-Seismic":
+                    value = {"YES": "SEISMIC", "NO": "NON-SEISMIC", "NON SEISMIC": "NON-SEISMIC"}.get(value, value)
                 value = re.sub(r"\s+(?:MINIMUM|INTERRUPT|HEAT TEST|GROUND BUS BOLTED TO).*$", "", value)
                 if value and value not in flattened:
                     flattened.append(value)
@@ -654,8 +787,10 @@ class ExcelParameterVariables:
 class ConfigurationRepository:
     """Loads checklist fields and their Database_Index2 label variants."""
 
-    def __init__(self, checklist_path=CHECKLIST_PATH):
-        self.checklist_path = checklist_path
+    def __init__(self, checklist_path=None):
+        self.checklist_path = checklist_path if checklist_path is not None else (
+            METADATA_PATH if os.path.exists(METADATA_PATH) else CHECKLIST_PATH
+        )
         self._records = self.load_configuration()
         self._parameter_rules = self._collect_parameter_rules()
 
@@ -672,19 +807,26 @@ class ConfigurationRepository:
             if "MCOE Checklist" not in workbook.sheetnames:
                 return {}
 
-            checklist = workbook["MCOE Checklist"]
-            database = workbook["Database_Index2"] if "Database_Index2" in workbook.sheetnames else None
+            rows = tuple(workbook["MCOE Checklist"].iter_rows(values_only=True))
+            codes = {normalize_code(row[1]) for row in rows[1:] if len(row) > 1 and row[1]}
+            database = {}
+            if "Database_Index2" in workbook.sheetnames:
+                for row in workbook["Database_Index2"].iter_rows(values_only=True):
+                    for offset in (0, 1):
+                        if offset < len(row) and normalize_code(row[offset]) in codes:
+                            database.setdefault(normalize_code(row[offset]), row[offset + 1:])
+                            break
             records = {}
 
-            for row_number in range(2, checklist.max_row + 1):
-                code_value = checklist.cell(row_number, 2).value
+            for row_number, row in enumerate(rows[1:], start=2):
+                code_value = row[1] if len(row) > 1 else None
                 if not isinstance(code_value, str) or not code_value.strip():
                     continue
 
                 parameters = []
-                for column in range(3, min(checklist.max_column, 13) + 1):
-                    name = checklist.cell(row_number, column).value
-                    alias = database.cell(row_number, column).value if database else None
+                aliases = database.get(normalize_code(code_value), ())
+                for index, name in enumerate(row[2:13]):
+                    alias = aliases[index] if index < len(aliases) else None
                     if not isinstance(name, str) or not name.strip():
                         name = alias
                     if not isinstance(name, str) or not name.strip():
@@ -697,15 +839,15 @@ class ConfigurationRepository:
                                 keywords.append(candidate.strip())
                     parameters.append(ParameterRule(name.strip(), tuple(keywords)))
 
-                if not parameters:
-                    continue
-
                 code = code_value.strip().upper()
-                category = checklist.cell(row_number, 1).value
+                category = row[0]
+                flag = row[13] if len(row) > 13 else None
                 records[code] = ConfigurationRecord(
                     code,
                     str(category).strip() if category is not None else "",
                     tuple(parameters),
+                    flag is True or isinstance(flag, str) and flag.strip().upper() == "TRUE",
+                    row_number,
                 )
 
             return records
@@ -732,7 +874,26 @@ class ConfigurationRepository:
 
     def get_configuration(self, assembly_code):
         key = str(assembly_code).strip().upper()
-        return self._records.get(key) or self._records.get(normalize_code(key))
+        return self._records.get(key) or next((
+            record for code, record in self._records.items() if normalize_code(code) == normalize_code(key)
+        ), None)
+
+    def code_mappings(self):
+        """Checklist C:M fields and Database_Index2 aliases, with N kept as metadata."""
+        return {
+            normalize_code(record.assembly_code): CodeMapping(
+                record.category, record.assembly_code,
+                tuple(rule.parameter_name for rule in record.parameters),
+                tuple(next((label for label in rule.keywords if label != rule.parameter_name), rule.parameter_name)
+                      for rule in record.parameters),
+                record.manually_mapped, record.checklist_row,
+            )
+            for record in self._records.values()
+        }
+
+    def reload(self):
+        self._records = self.load_configuration()
+        self._parameter_rules = self._collect_parameter_rules()
 
     def use_code_mappings(self, mappings):
         """Replaces the checklist with Sheet1 rows: each parameter name is its own keyword."""
@@ -744,6 +905,8 @@ class ConfigurationRepository:
                     ParameterRule(name, tuple(dict.fromkeys((name, alias or name))))
                     for name, alias in zip(mapping.parameters, mapping.aliases or mapping.parameters) if name
                 ),
+                mapping.manually_mapped is True,
+                mapping.checklist_row,
             )
             for key, mapping in mappings.items() if any(mapping.parameters)
         }
@@ -756,7 +919,16 @@ class ConfigurationRepository:
             alternatives = "|".join(re.escape(label) for label in labels)
             pattern = re.compile(rf"(?im)^\s*(?:{alternatives})\s*[:=]\s*(\S(?:.*\S)?)\s*$")
             for match in pattern.finditer(text or ""):
-                repository.add_parameter(rule.parameter_name, match.group(1), source)
+                value = match.group(1)
+                if ClassifierWorkbookParser.parameter_key(rule.parameter_name) == "PHASE":
+                    # ABC feeder labels describe phase order, not the system's phase count.
+                    phase = re.fullmatch(r"(1|3|SINGLE|THREE)(?:\s*-?\s*(?:PHASE|PH))?", value, re.I)
+                    if phase:
+                        value = "1" if phase[1].upper() in {"1", "SINGLE"} else "3"
+                    elif re.match(r"[ABC](?:\s*[-/,]?\s*[ABC]){0,2}(?=\s|$)", value, re.I):
+                        repository.add_parameter("Phase Order", value, source)
+                        continue
+                repository.add_parameter(rule.parameter_name, value, source)
         return repository
 
 
@@ -833,14 +1005,23 @@ def section_bus_requirements(source_text, source):
     return requirements
 
 
+def is_bus_description(description):
+    return bool(
+        re.search(r"\b(?:X-?BUS|CROSS\s*BUS|BUS(?:ES)?|SPLICES?)\b", description, re.I)
+        or re.search(r"\bUGPS\b.*\d.*\b(?:CU|CUAG|CUSN|AL)\b", description, re.I)
+    )
+
+
 def assembly_bus_requirements(requirements, section_number, description):
-    if not re.search(r"\b(?:X-?BUS|CROSS\s*BUS|BUS(?:ES)?|SPLICES?)\b", description, re.I):
+    if not is_bus_description(description):
         return None
     return requirements.get(int(section_number)) if section_number is not None else None
 
 
 def extract_table_selectors(text, source):
     repository = ParameterRepository()
+    for match in re.finditer(r"(?im)^\s*Bus\s+(?:Amps|Amperage)\s*:\s*(\d+)\b", text):
+        repository.add_parameter("Bus Amperage", match[1], source)
     for name in ("NG Drawout", "Structure Material", "Test Plug", "Metering Configuration", "Table Row", "Door Vents"):
         pattern = rf"(?im)^\s*{re.escape(name)}\s*[:=]\s*([^\r\n]+)"
         for match in re.finditer(pattern, text):
@@ -849,10 +1030,32 @@ def extract_table_selectors(text, source):
 
 
 class DWGFile:
-    """Reads labeled text and block attributes from a native DWG via AutoCAD COM."""
+    """Read native DWG text and section blocks without closing existing documents.
+
+    Known Config door blocks supply hinge side only when their width and top-left
+    insertion point identify one unrotated, unscaled SECTION_NUMBER structure.
+    """
 
     def __init__(self, file_path):
         self.file_path = file_path
+        self.section_parameters = {}
+
+    @staticmethod
+    def section_block_parameters(sections, doors, source):
+        result = {}
+        for number, x, y, width, height, depth in sections:
+            repository = result.setdefault(str(number), ParameterRepository())
+            for name, value in (("Width (Wide)", width), ("Height", height), ("Depth", depth)):
+                if value:
+                    repository.add_parameter(name, _format_dim(value), f"{source}: section {number} block")
+        for name, x, y, width, side in doors:
+            owners = {
+                str(number) for number, sx, sy, sw, sh, _depth in sections
+                if sh and abs(sx - x) < 0.01 and abs(sy + sh - y) < 0.01 and abs(sw - width) < 0.01
+            }
+            if len(owners) == 1:
+                result[next(iter(owners))].add_parameter("Hinge Side", side, f"{source}: {name}")
+        return result
 
     @staticmethod
     def _entity_text(entity):
@@ -893,15 +1096,35 @@ class DWGFile:
             document = app.Documents.Open(path, True)
         try:
             text_chunks = []
+            sections, doors = [], []
             for space_name in ("ModelSpace", "PaperSpace"):
-                try:
-                    space = getattr(document, space_name)
-                    for entity in space:
-                        text = self._entity_text(entity)
-                        if text:
-                            text_chunks.append(text)
-                except Exception:
-                    continue
+                space = getattr(document, space_name)
+                for entity in space:
+                    text = self._entity_text(entity)
+                    if text:
+                        text_chunks.append(text)
+                    if space_name != "ModelSpace" or entity.ObjectName != "AcDbBlockReference":
+                        continue
+                    name = str(getattr(entity, "Name", ""))
+                    door = re.fullmatch(r"Config\d+_(\d+)_(Rt|Lft)", name, re.I)
+                    number = re.search(r"(?im)^SECTION_NUMBER:\s*(\d+)\s*$", text)
+                    if not (door or number):
+                        continue
+                    if abs(float(entity.Rotation)) > 0.001 or any(
+                        abs(float(getattr(entity, axis)) - 1) > 0.001
+                        for axis in ("XScaleFactor", "YScaleFactor")
+                    ):
+                        continue
+                    x, y, _z = entity.InsertionPoint
+                    if door:
+                        doors.append((name, x, y, float(door[1]), "RIGHT" if door[2].upper() == "RT" else "LEFT"))
+                    elif entity.IsDynamicBlock:
+                        properties = {str(p.PropertyName).lower(): p.Value for p in entity.GetDynamicBlockProperties()}
+                        width, height = properties.get("width"), properties.get("height")
+                        if isinstance(width, (float, int)) and isinstance(height, (float, int)):
+                            depth = properties.get("depth")
+                            sections.append((number[1], x, y, width, height, depth if isinstance(depth, (int, float)) else None))
+            self.section_parameters = self.section_block_parameters(sections, doors, os.path.basename(self.file_path))
             return "\n".join(text_chunks)
         finally:
             if opened:
@@ -987,6 +1210,7 @@ def table_dimension_lookup(values, family, base, suffix):
 GROUP_HEADERS = {"GROUP", "GROUPS"}
 HEADER_LOOKBACK = 2
 CONTEXT_LOOKBACK = 6
+FULL_SHEET_CELL_LIMIT = 40000
 NUMERIC_VALUE_RE = re.compile(r"^([0-9]*\.?[0-9]+)\s*[A-Z\"'%]*$")
 
 
@@ -1024,6 +1248,8 @@ class TableCandidate:
     rows: tuple[tuple, ...]
     context: str
     keyword_score: int = 0
+    classifier_type: str = ""
+    parameter_names: tuple[str, ...] = ()
 
     def column_for(self, parameter_name):
         key = normalize_code(parameter_name)
@@ -1093,6 +1319,190 @@ class WorkbookParser:
             ))
 
         return tables
+
+
+class ClassifierWorkbookParser:
+    """Adapt the generalized parser's configurations to the audit table interface."""
+
+    @staticmethod
+    @lru_cache(maxsize=1)
+    def semantics():
+        with open(SEMANTIC_PATH, encoding="utf-8") as stream:
+            return json.load(stream)
+
+    @staticmethod
+    @lru_cache(maxsize=512)
+    def parameter_key(name):
+        key = normalize_code(name)
+        for parent, info in ClassifierWorkbookParser.semantics()["parameters"].items():
+            if key in {normalize_code(label) for label in (parent, *info.get("aliases", ()))}:
+                key = normalize_code(parent)
+                break
+        return {
+            "WIDTHWIDE": "STRUCTUREWIDTH",
+            "HEATTESTDENSITY": "TEST",
+            "31PHASE": "PHASE",
+            "31PHASE31": "PHASE",
+            "34WIRE": "WIRES",
+            "34WIRE34": "WIRES",
+            "WIRE": "WIRES",
+        }.get(key, key)
+
+    @staticmethod
+    @lru_cache(maxsize=512)
+    def parameter_labels(name):
+        key = ClassifierWorkbookParser.parameter_key(name)
+        labels = {normalize_code(name), key}
+        for parent, info in ClassifierWorkbookParser.semantics()["parameters"].items():
+            if ClassifierWorkbookParser.parameter_key(parent) == key:
+                labels.update(normalize_code(label) for label in (parent, *info.get("aliases", ())))
+        for alias in ("Width (Wide)", "Heat Test/Density", "3/1 Phase", "3/1 Phase (3/1)"):
+            if ClassifierWorkbookParser.parameter_key(alias) == key:
+                labels.add(normalize_code(alias))
+        return frozenset(labels)
+
+    @staticmethod
+    def extract_tables(workbook, file_name, base, parser=None):
+        from Classifier import parse_assembly
+
+        tables = []
+        parsed_sheets = parser.parse(base) if parser is not None else parse_assembly(
+            file_name, base, METADATA_PATH, SEMANTIC_PATH, workbook=workbook,
+        )
+        for parsed in parsed_sheets:
+            configurations = parsed["result"]["Configurations"]
+            for configuration in configurations:
+                group = configuration.get("Group No.", configuration.get("Group"))
+                if not group:
+                    raise ValueError(f"{file_name} / {parsed['sheet_name']}: configuration has no group.")
+                parameters = tuple(
+                    name for name in configuration
+                    if name not in ("Group", "Group No.")
+                    and ClassifierWorkbookParser.parameter_key(name) != "ASSEMBLYNUMBER"
+                )
+                names = ("Assembly Number", *parameters, "Group")
+                tables.append(TableCandidate(
+                    parsed["sheet_name"],
+                    tuple(ClassifierWorkbookParser.parameter_labels(name) for name in names),
+                    len(names) - 1,
+                    ((base, *(configuration[name] for name in parameters), group),),
+                    base,
+                    classifier_type=parsed["parser_type"],
+                    parameter_names=parameters,
+                ))
+        return tuple(tables)
+
+    @staticmethod
+    def values_match(derived, wanted):
+        from Classifier import AnchoredTableParser
+
+        keyword_mapping = {
+            normalize_code(key): value
+            for key, value in ClassifierWorkbookParser.semantics().get("keyword_mapping", {}).items()
+        }
+
+        derived = _cell_text(keyword_mapping.get(normalize_code(derived), derived))
+        wanted = _cell_text(keyword_mapping.get(normalize_code(wanted), wanted))
+        derived = _cell_text(AnchoredTableParser.TESTS.get(derived, derived))
+        wanted = _cell_text(AnchoredTableParser.TESTS.get(wanted, wanted))
+        if derived == "ALL":
+            return bool(wanted)
+        minimum = re.fullmatch(r'(\d+(?:\.\d+)?)\s*[DW"]?\s*MIN\.?', derived)
+        number = NUMERIC_VALUE_RE.fullmatch(wanted)
+        if minimum:
+            return bool(number and float(number[1]) >= float(minimum[1]))
+        bounds = re.fullmatch(r"(\d+)\s*-\s*(\d+)\s*A?", derived)
+        wanted_bounds = re.fullmatch(r"(\d+)\s*-\s*(\d+)\s*A?", wanted)
+        if bounds:
+            if wanted_bounds:
+                return float(bounds[1]) <= float(wanted_bounds[1]) <= float(wanted_bounds[2]) <= float(bounds[2])
+            return bool(number and float(bounds[1]) <= float(number[1]) <= float(bounds[2]))
+        if wanted_bounds:
+            return False
+        return _grid_value_matches(derived, wanted)
+
+    @staticmethod
+    def consistent_value(values):
+        values = list(dict.fromkeys(values))
+        if not values or any(
+            not ClassifierWorkbookParser.values_match(left, right)
+            for index, left in enumerate(values) for right in values[index + 1:]
+        ):
+            return ""
+        specific = [
+            value for value in values
+            if MATERIAL_ALIASES.get(_cell_text(value), _cell_text(value)) in {"CUAG", "CUSN", "CUTN", "TIN PLATED ALUMINUM"}
+        ]
+        return specific[0] if specific else values[0]
+
+    @staticmethod
+    def identify_group(tables, base, wanted):
+        """Require distinguishing inputs; never choose using the BOM's group."""
+        amperages = [(name, value) for name, value in wanted.items()
+                     if ClassifierWorkbookParser.parameter_key(name) == "AMPERAGE" and value]
+        if len(amperages) == 1:
+            name, value = amperages[0]
+            bounds = re.fullmatch(r"(\d+)\s*-\s*(\d+)\s*A?", str(value))
+            columns = [next((table.column_for(parameter) for parameter in table.parameter_names
+                             if ClassifierWorkbookParser.parameter_key(parameter) == "AMPERAGE"), None)
+                       for table in tables]
+            if bounds and columns and all(column is not None for column in columns):
+                ratings = {str(row[column]) for table, column in zip(tables, columns)
+                           for row in table.rows_for_base(base)}
+                if ratings and all(re.fullmatch(r"\d+", rating) for rating in ratings):
+                    low, high = map(int, bounds.groups())
+                    if str(low) not in ratings or str(high) not in ratings or low > high:
+                        return "", f"Classifier: amperage range {value} is not bounded by listed ratings."
+                    results = [
+                        ClassifierWorkbookParser.identify_group(tables, base, {**wanted, name: rating})
+                        for rating in sorted(ratings, key=int) if low <= int(rating) <= high
+                    ]
+                    groups = {group for group, _message in results}
+                    if len(groups) == 1 and "" not in groups:
+                        return results[0][0], f"{results[0][1]} Same group for all listed ratings in {value}A."
+                    reason = next((message for group, message in results if not group),
+                                  "Classifier: different groups apply within the amperage range.")
+                    return "", reason
+        inputs = {}
+        for name, value in wanted.items():
+            if value:
+                inputs.setdefault(ClassifierWorkbookParser.parameter_key(name), []).append(value)
+        if "DOORTYPE" in inputs and "ASSEMBLYTYPE" not in inputs:
+            inputs["ASSEMBLYTYPE"] = ["DOOR"]
+        groups = set()
+        missing = set()
+        sources = set()
+        names = {name for table in tables for name in table.parameter_names}
+        invariants = {
+            name for name in names
+            if not name.startswith("Unparsed ")
+            and all(table.column_for(name) is not None for table in tables)
+            and len({str(row[table.column_for(name)]) for table in tables for row in table.rows_for_base(base)}) == 1
+        }
+        for table in tables:
+            required = {name: inputs.get(ClassifierWorkbookParser.parameter_key(name), ()) for name in table.parameter_names}
+            for row in table.rows_for_base(base):
+                if any(
+                    values and not all(ClassifierWorkbookParser.values_match(
+                        row[table.column_for(name)], value,
+                    ) for value in values)
+                    for name, values in required.items()
+                ):
+                    continue
+                absent = {name for name, values in required.items() if not values and name not in invariants}
+                if not required:
+                    absent.add("unparsed table selection criteria")
+                missing.update(absent)
+                if not absent:
+                    groups.add(_cell_text(row[table.group_column]))
+                    sources.add(f"{table.sheet_name} ({table.classifier_type})")
+        if len(groups) == 1 and not missing:
+            return next(iter(groups)), f"Classifier group found in {', '.join(sorted(sources))}."
+        if len(groups) > 1:
+            return "", f"Classifier: multiple groups match: {', '.join(sorted(groups))}."
+        if missing:
+            return "", f"Classifier: missing job inputs: {', '.join(sorted(missing))}."
+        return "", "Classifier: no configuration matches the job inputs."
 
 
 class TableSelector:
@@ -1317,7 +1727,22 @@ def find_assembly_column_matches(values, sheet_name, base, group):
     return matches
 
 
+def end_cap_position(text):
+    text = _cell_text(text)
+    if not re.search(r"\bEND\s*CAPS?\b", text):
+        return ""
+    positions = {
+        value for value, pattern in (
+            ("LEFT", r"\b(?:LEFT|LH)\b"),
+            ("RIGHT", r"\b(?:RIGHT|RH)\b"),
+            ("CENTER", r"\b(?:INTERMEDIATE|CENTER|CENTRE|CTR)\b"),
+        ) if re.search(pattern, text)
+    }
+    return next(iter(positions)) if len(positions) == 1 else ""
+
+
 def find_smart_table_matches(values, sheet_name, base, group):
+    """Keep each INPUT/OUTPUT table, row enclosure type and output position scoped."""
     matches = []
     recognized = False
     aliases = {
@@ -1333,24 +1758,37 @@ def find_smart_table_matches(values, sheet_name, base, group):
             continue
         end = next((column for column in range(outputs + 1, len(marker)) if _cell_text(marker[column])), len(marker))
         header = values[marker_index + 1]
-        for row_number, row in enumerate(values[marker_index + 2:], marker_index + 3):
+        for row in values[marker_index + 2:]:
+            if not any(_cell_text(cell) for cell in row) or (
+                any(_cell_text(cell) == "INPUT" for cell in row)
+                and any(_cell_text(cell) == "OUTPUT" for cell in row)
+            ):
+                break
             axes = []
             for column in range(inputs, outputs):
                 name = _cell_text(_cell_at(header, column))
                 value = _cell_text(_cell_at(row, column))
                 if name and value and value != "N/A":
-                    axes.append((aliases.get(normalize_code(name), name.title()), value))
-            enclosure = re.search(r"TYPE\s+(3R|1)\b", sheet_name.upper())
-            if enclosure:
+                    parameter = aliases.get(normalize_code(name), name.title())
+                    if normalize_code(name) == "MATERIAL" and re.search(r"\b(?:GALVANIZED|STEEL)\b", value):
+                        parameter = "Structure Material"
+                    axes.append((parameter, value))
+            enclosure_text = next((value for name, value in axes if name == "Structure Type"), sheet_name.upper())
+            enclosure = re.search(r"TYPE\s*(3R|1)\b", enclosure_text)
+            mixed_enclosure = re.search(r"TYPE\s*1\s*(?:&|AND|/|OR)\s*(?:TYPE\s*)?3R\b", enclosure_text)
+            if enclosure and not mixed_enclosure:
                 axes.append(("NEMA 1/3R", enclosure.group(1)))
             for column in range(outputs, end):
                 style = style_pattern.fullmatch(_cell_text(_cell_at(row, column)))
                 if style:
                     recognized = True
                     if not group or style.group(1) == group.upper():
+                        output_label = _cell_text(_cell_at(header, column))
+                        position = end_cap_position(output_label)
+                        output_axes = axes + ([("End Cap Position", position)] if position else [])
                         matches.append(GridMatch(
-                            sheet_name, (), _cell_text(_cell_at(header, column)), (), "",
-                            style.group(1), tuple(axes), tuple(name for name, _value in axes),
+                            sheet_name, (), output_label, (), "",
+                            style.group(1), tuple(output_axes), tuple(name for name, _value in output_axes),
                         ))
     return matches if recognized else None
 
@@ -1541,17 +1979,28 @@ def merge_grid_matches(matches, structure_width=""):
 def description_parameter_values(description):
     """Parameters readable from an assembly description, e.g. '800A CUAG DEN 3PH'."""
 
+    from Classifier import AnchoredTableParser
+
     text = (description or "").upper()
     found = grid_parameter_values(GridMatch("", (text,), "", (text,), ""))
+    found.update(AnchoredTableParser.attributes(text))
+    position = end_cap_position(text)
+    if position:
+        found["End Cap Position"] = position
+    door_widths = re.search(r"\b(?:DBL|DOUBLE)[ ,]*(?:DR|DOORS?)?[ ,]*(\d{2})\s*-\s*(\d{2})\b", text)
+    if door_widths:
+        found["Structure Width - Left (Or Single) Door"] = door_widths[1]
+        found["Structure Width - Right Door"] = door_widths[2]
+    if re.search(r"\b\d+\s*A\s+MAX\b", text):
+        found.pop("Amperage", None)
 
-    if "Amperage" not in found:
-        # '25-3000' reads as 2500-3000A; '2500-3000' as is.
-        short = re.search(r"\b(\d{2})\s*-\s*(\d{4})\b", text)
-        full = re.search(r"\b(\d{4})\s*-\s*(\d{4})\b", text)
-        if full:
-            found["Amperage"] = f"{full.group(1)}-{full.group(2)}"
-        elif short:
-            found["Amperage"] = f"{short.group(1)}00-{short.group(2)}"
+    # Preserve the range rather than treating its upper endpoint as the job rating.
+    short = re.search(r"\b(\d{2})\s*-\s*(\d{4})\b", text)
+    full = re.search(r"\b(\d{3,4})\s*-\s*(\d{3,4})\s*A?\b", text)
+    if full:
+        found["Amperage"] = f"{full.group(1)}-{full.group(2)}"
+    elif short:
+        found["Amperage"] = f"{short.group(1)}00-{short.group(2)}"
 
     height = re.search(r'(\d+)\s*"?\s*(?:HIGH|HEIGHT|H)\b', text)
     if height:
@@ -1568,11 +2017,12 @@ MATERIAL_ALIASES = {
     "SILVER PLATED COPPER": "CUAG", "TIN PLATED COPPER": "CUSN",
 }
 COPPER_MATERIALS = {"CU", "CUAG", "CUSN", "CUTN"}
+ALUMINUM_MATERIALS = {"AL", "TIN PLATED ALUMINUM"}
 
 
 def _grid_value_matches(derived, wanted):
     """Sheet value vs job value: '2500/3000' lists, '2500-3000' ranges (either side),
-    '30D MIN', COPPER/CU spellings and plain CU for any plated copper count as equal."""
+    '30D MIN', and generic CU/AL headings for their supported plated materials."""
 
     def clean(text):
         text = re.sub(r"\s*MIN$", "", _cell_text(text).strip())
@@ -1583,11 +2033,19 @@ def _grid_value_matches(derived, wanted):
     wanted_number = NUMERIC_VALUE_RE.match(wanted)
     wanted_bounds = re.fullmatch(r"(\d+)\s*-\s*(\d+)", wanted)
 
+    if re.fullmatch(r"SEISMIC \((?:FREESTANDING OR WALL SECURED|WALL SECURED OR FREESTANDING)\)", clean(derived)):
+        return wanted in {"SEISMIC", "SEISMIC (FREESTANDING)", "SEISMIC (WALL SECURED)"}
+    alternatives = re.split(r"\s+OR\s+(?![^()]*\))", str(derived), flags=re.I)
+    if len(alternatives) > 1 and not any(re.search(r"\d", part) for part in alternatives):
+        return any(_grid_value_matches(part, wanted) for part in alternatives)
+
     for part in str(derived).split("/"):
         part = clean(part)
         if values_match(part, wanted):
             return True
         if part in COPPER_MATERIALS and wanted in COPPER_MATERIALS and "CU" in (part, wanted):
+            return True
+        if part in ALUMINUM_MATERIALS and wanted in ALUMINUM_MATERIALS and "AL" in (part, wanted):
             return True
         bounds = re.fullmatch(r"(\d+)\s*-\s*(\d+)", part)
         number = NUMERIC_VALUE_RE.match(part)
@@ -1686,7 +2144,8 @@ def workbook_migration(sheets):
 
 def find_grid_group(sheets, base, wanted, common_parameters=None, description=""):
     """(group, message) for grid-layout family sheets: the one group whose table agrees with
-    every job value it can be compared on ({parameter name: value})."""
+    every job value. Fixed root applicability fields need no extra input, but dimensions
+    and varying selectors do. Supplied values must agree even with fixed fields."""
 
     migration = workbook_migration(sheets)
     if migration is not None:
@@ -1733,25 +2192,43 @@ def find_grid_group(sheets, base, wanted, common_parameters=None, description=""
     wanted = {normalize_code(name): value for name, value in wanted.items() if value}
     groups = {}
     missing = set()
+    configurations = [
+        {normalize_code(name): value for name, value in grid_parameter_values(match).items()}
+        for table_matches in by_table.values() for match in table_matches
+    ]
+    required = {normalize_code(name) for table_matches in by_table.values()
+                for match in table_matches for name in match.required_parameters}
+    invariants = {
+        name for name in required
+        if ClassifierWorkbookParser.parameter_key(name) not in {
+            "STRUCTUREWIDTH", "STRUCTUREDEPTH", "STRUCTUREHEIGHT", "HEIGHT",
+        }
+        and all(name in configuration for configuration in configurations)
+        and len({configuration[name] for configuration in configurations}) == 1
+    }
 
     for (group, sheet_name, section), matches in by_table.items():
         for match in matches:
             derived = {normalize_code(name): value for name, value in grid_parameter_values(match).items()}
-            absent = [name for name in match.required_parameters if not wanted.get(normalize_code(name))]
+            compared = [name for name in wanted if name in derived]
+            if any(not _grid_value_matches(derived[name], wanted[name]) for name in compared):
+                continue
+            absent = [name for name in match.required_parameters
+                      if not wanted.get(normalize_code(name)) and normalize_code(name) not in invariants]
             if absent:
                 missing.update(absent)
                 continue
-            compared = [name for name in wanted if name in derived]
             if compared and all(_grid_value_matches(derived[name], wanted[name]) for name in compared):
                 evidence = f"{sheet_name} / {section}" if section else sheet_name
                 if match.required_parameters:
-                    inputs = ", ".join(f"{name}={wanted[normalize_code(name)]}" for name in match.required_parameters)
+                    inputs = ", ".join(f"{name}={wanted[normalize_code(name)]}" for name in match.required_parameters
+                                       if normalize_code(name) in wanted)
                     evidence += f" [inputs: {inputs}]"
                 groups.setdefault(group, set()).add(evidence)
 
+    if missing:
+        return "", f"Missing required table inputs: {', '.join(sorted(missing))}."
     if not groups:
-        if missing:
-            return "", f"Missing required table inputs: {', '.join(sorted(missing))}."
         return "", "No grid group matches the job parameter values."
     if len(groups) > 1:
         return "", f"Multiple groups match: {', '.join(sorted(groups))}."
@@ -1776,6 +2253,55 @@ def structure_dimensions_of(items):
                 return width.group(1) if width else "", depth.group(1) if depth else ""
 
     return "", ""
+
+
+def extract_job_dimensions(text, source):
+    """Keep explicitly labeled job dimensions separate from section-specific values."""
+
+    global_values = ParameterRepository()
+    sections = {}
+    current = global_values
+    header = re.compile(r"^\s*(?:SECTION|STRUCTURE)\s+(?:NO\.?\s*)?(\d+)\b", re.I)
+    dimension = re.compile(
+        r'\b(?P<name>STRUCTURE\s+DEPTH|SECTION\s+DEPTH|DEPTH(?:\s*\(INNER\))?|'
+        r'STRUCTURE\s+WIDTH|SECTION\s+WIDTH|WIDTH(?:\s*\(WIDE\))?)'
+        r'\s*(?:[:=]|-(?!\d))\s*(?P<value>\d{1,3}(?:\.\d+)?)'
+        r'(?:\s*(?:INCHES|INCH|IN\.?|["WD]))?(?=\s|[,;]|$)',
+        re.I,
+    )
+    for line in (text or "").splitlines():
+        match = header.match(line)
+        if match:
+            current = sections.setdefault(match.group(1), ParameterRepository())
+        for match in dimension.finditer(line):
+            name = "Depth" if "DEPTH" in match.group("name").upper() else "Width (Wide)"
+            current.add_parameter(name, match.group("value"), source)
+        for name, patterns in (
+            ("Depth", _ECOE_DEPTH),
+            ("Width (Wide)", _ECOE_WIDTH),
+        ):
+            for pattern in patterns:
+                for match in re.finditer(pattern, line, re.I):
+                    current.add_parameter(name, match.group(1), source)
+    return global_values, sections
+
+
+def dimension_entries(repository, name):
+    aliases = DEPTH_LABELS if ConfigurationRepository._normalized(name) in DEPTH_LABELS else WIDTH_LABELS | {"section width"}
+    return tuple(
+        entry for alias in sorted(aliases)
+        for entry in repository.get_entries(alias)
+    )
+
+
+def dimension_value(entries):
+    values = set()
+    for value, _source in entries:
+        match = NUMERIC_VALUE_RE.fullmatch(_cell_text(value))
+        if not match:
+            return ""
+        values.add(_format_dim(float(match.group(1))))
+    return next(iter(values)) if len(values) == 1 else ""
 
 
 def structure_width_of(items):
@@ -1815,17 +2341,40 @@ class ExcelComSession:
     loaded, Index2's own `.Path` resolves to its real SharePoint folder, which
     is then combined with the target filename and opened directly - no
     manual steps and no relying on Hyperlink.Follow(). Already-open
-    workbooks are reused when possible."""
+    workbooks are reused when possible.
+
+    Assembly-specific reads use Classifier.py with the adjacent Metadata.xlsx
+    and semantic_aliases.example.json. Live values and merged ranges are copied
+    in memory; no local workbook export or parser output files are required.
+    Family workbooks opened by this session are closed after capture; Index2
+    and workbooks already open in the user's Excel are never closed.
+    Unrecognized layouts retain the existing readers. Parser failures are
+    surfaced to the audit as unresolved rather than silently falling back.
+    Family COM operations run in excel_capture.py with a hard deadline. A timed
+    out Excel session is not reused for further uncached families in that run.
+    """
 
     INDEX2_LOAD_TIMEOUT = 150
+    FAMILY_CAPTURE_TIMEOUT = 45
 
     def __init__(self, status_callback=None):
         self._app = None
         self._index2_wb = None
         self._index2_map = None
+        self._index2_catalog = None
         self._family_workbooks = {}
         self._group_tables = {}
         self._sheet_values = {}
+        self._source_names = {}
+        self._classifier_snapshots = {}
+        self._classifier_tables = {}
+        self._classifier_parsers = {}
+        self._family_read_errors = {}
+        self._index2_folder = None
+        self._replacement_links = None
+        self._excel_blocked_message = ""
+        self._assembly_targets = {}
+        self._captured_roots = {}
         self.status_callback = status_callback
 
     def _report(self, text):
@@ -1935,14 +2484,59 @@ class ExcelComSession:
         wb = self._get_index2_workbook()
         self._report("Reading Index2's assembly index (live)...")
         self._index2_map = build_index2_map_from_com(wb.Sheets(1))
+        self._index2_folder = wb.Path
+        self._cache_replacement_links(wb)
 
         return self._index2_map
+
+    def get_index2_catalog(self, refresh=False):
+        """Read only Index2, never family workbooks, for the coverage inventory."""
+        if refresh or self._index2_catalog is None:
+            workbook = self._get_index2_workbook()
+            self._index2_catalog = read_index2_root_catalog(workbook.Sheets(1))
+        return self._index2_catalog
+
+    def _cache_replacement_links(self, workbook):
+        links = {}
+        for hyperlink in workbook.Worksheets(1).Hyperlinks:
+            if hyperlink.Range.Column != 5:
+                continue
+            address = str(hyperlink.Address or "")
+            if not address:
+                continue
+            for name in (str(hyperlink.Range.Value or ""), link_file_name(address)):
+                links.setdefault(normalize_code(name), set()).add(address)
+        self._replacement_links = links
+
+    def _replacement_link(self, target, notice, previous_link=""):
+        if self._replacement_links is None:
+            self._cache_replacement_links(self._get_index2_workbook())
+        candidates = self._replacement_links.get(normalize_code(link_file_name(target)), set())
+        roots = self._assembly_targets.get(previous_link.upper(), ())
+        if not candidates and roots:
+            catalog = self.get_index2_catalog()
+            alternatives = [{
+                entry.link for entry in catalog if entry.root == root and entry.link
+                and link_file_name(entry.link).casefold() != link_file_name(previous_link).casefold()
+            } for root in roots]
+            candidates = set.intersection(*alternatives)
+            if len(candidates) == 1:
+                self._report(f"Retired {target}: Index2 lists one common replacement for {', '.join(sorted(roots))}.")
+        if len(candidates) != 1:
+            raise RuntimeError(f"Replacement {target} has no unique Index2 link. {notice}")
+        replacement = next(iter(candidates))
+        if replacement.startswith("../"):
+            from urllib.parse import urljoin
+            if self._index2_folder is None:
+                self._index2_folder = self._get_index2_workbook().Path
+            replacement = urljoin(str(self._index2_folder).rstrip("/") + "/", replacement)
+        return replacement
 
     def get_family_workbook(self, link_target):
         """Reuse or open the live workbook linked by Index2."""
 
         app = self._get_app()
-        is_absolute = "://" in link_target
+        is_absolute = "://" in link_target or os.path.isabs(link_target)
         file_name = link_file_name(link_target)
 
         if app is not None:
@@ -1958,21 +2552,52 @@ class ExcelComSession:
             except Exception:
                 self._family_workbooks.pop(link_target.upper(), None)
 
-        index2_wb = self._get_index2_workbook()
-        app = self._get_app()
-
         self._report(f"Opening {file_name}...")
 
         if is_absolute:
-            url = link_target
+            url = excel_document_url("", link_target)
+            if app is None:
+                raise RuntimeError("Excel is not running. Open Index2 before starting the audit.")
         else:
+            index2_wb = self._get_index2_workbook()
+            app = self._get_app()
             folder = index2_wb.Path
             if not folder:
                 raise RuntimeError("Index2's live folder could not be resolved.")
-            url = f"{folder}/{link_target}"
-        target_wb = app.Workbooks.Open(url, ReadOnly=True, UpdateLinks=0)
+            url = excel_document_url(folder, link_target)
+        target_wb = app.Workbooks.Open(
+            url, ReadOnly=True, UpdateLinks=0, Notify=False,
+            IgnoreReadOnlyRecommended=True, AddToMru=False,
+        )
         self._family_workbooks[link_target.upper()] = target_wb
         return target_wb
+
+    def _excel_call(self, operation, callback):
+        for attempt in range(4):
+            try:
+                return callback()
+            except Exception as exc:
+                details = getattr(exc, "excepinfo", None)
+                codes = (getattr(exc, "hresult", None), details[-1] if details else None)
+                if not any(isinstance(code, int) and code & 0xFFFFFFFF == 0x800AC472 for code in codes) or attempt == 3:
+                    raise
+                self._report(f"Excel is busy during {operation}; retry {attempt + 1}/3.")
+                time.sleep(0.5 * (attempt + 1))
+
+    def _close_owned_family(self, link_target):
+        key = link_target.upper()
+        workbook = self._family_workbooks.get(key)
+        if workbook is None:
+            return
+        if os.path.splitext(workbook.Name)[0].upper() == "INDEX2":
+            return
+        self._report(f"Closing {workbook.Name}; captured data remains cached.")
+        try:
+            self._excel_call(f"closing {workbook.Name}", lambda: workbook.Close(False))
+        except Exception as exc:
+            self._report(f"Could not close {link_file_name(link_target)}: {exc}")
+            raise
+        self._family_workbooks.pop(key, None)
 
     def read_sheets_values(self, url, sheet_names, open_if_missing=True):
         """Read requested sheets, optionally opening the workbook when it is not already open."""
@@ -1999,10 +2624,10 @@ class ExcelComSession:
         try:
             for sheet_name in sheet_names:
                 try:
-                    values = workbook.Worksheets(sheet_name).UsedRange.Value
+                    values = normalize_excel_rows(workbook.Worksheets(sheet_name).UsedRange.Value)
                 except Exception:
                     continue
-                if isinstance(values, tuple):
+                if values:
                     sheets[sheet_name] = values
         finally:
             if existing is None:
@@ -2038,17 +2663,19 @@ class ExcelComSession:
         return self.get_family_workbook(link_target).Worksheets(sheet_name)
 
     def lookup_dimensions(self, link_target, sheet_name, base, suffix):
-        workbook = self.get_family_workbook(link_target)
-        family = os.path.splitext(workbook.Name)[0].upper()
+        self.get_group_tables(link_target, assembly_base=base)
+        key = link_target.upper()
+        file_name = self._source_names[key]
+        family = os.path.splitext(file_name)[0].upper()
         if family == "BASICSTR":
             if not sheet_name:
                 return DimensionResult(message="BASICSTR requires an enclosure type from QuickPrint.")
-            sheet = workbook.Worksheets(sheet_name)
-            width, depth = com_grid_lookup(sheet, base, suffix)
+            sheet = self._classifier_snapshots[key][sheet_name]
+            width, depth = snapshot_grid_lookup(sheet, base, suffix)
             return DimensionResult(
                 width, depth,
                 "Width and depth found." if width and depth else "Base/group not found in enclosure grid.",
-                f"{workbook.Name} / {sheet.Name}",
+                f"{file_name} / {sheet.title}",
             )
 
         results = []
@@ -2057,11 +2684,11 @@ class ExcelComSession:
             if result is not None:
                 results.append(DimensionResult(
                     result.width, result.depth, result.message,
-                    f"{workbook.Name} / {name}",
+                    f"{file_name} / {name}",
                 ))
 
         if not results:
-            return DimensionResult(message="Base not found on active worksheets.", source=workbook.Name)
+            return DimensionResult(message="Base not found on active worksheets.", source=file_name)
         if len({(result.width, result.depth, result.message) for result in results}) != 1:
             return DimensionResult(
                 message="Different worksheet results; selection unresolved.",
@@ -2073,7 +2700,200 @@ class ExcelComSession:
             "; ".join(result.source for result in results),
         )
 
-    def get_group_tables(self, link_target, _visited=()):
+    def get_group_tables(self, link_target, _visited=(), assembly_base=None):
+        key = link_target.upper()
+        if assembly_base:
+            base, _group = split_style_number(assembly_base.strip().upper())
+            assembly_base = base
+            targets = self._assembly_targets.setdefault(key, set())
+            targets.add(base)
+        targets = self._assembly_targets.get(key, set())
+        captured = self._captured_roots.get(key)
+        if captured and not targets.issubset(captured):
+            self._group_tables.pop(key, None)
+            self._sheet_values.pop(key, None)
+            self._classifier_parsers.pop(key, None)
+            snapshot = self._classifier_snapshots.pop(key, None)
+            if snapshot is not None:
+                snapshot.close()
+            self._classifier_tables = {
+                cache_key: tables for cache_key, tables in self._classifier_tables.items() if cache_key[0] != key
+            }
+        error_key = (key, assembly_base.upper() if assembly_base else None)
+        error = self._family_read_errors.get((key, None)) or self._family_read_errors.get(error_key)
+        if error:
+            raise RuntimeError(error)
+        try:
+            return self._read_group_tables(link_target, _visited, assembly_base)
+        except Exception as exc:
+            if key not in self._group_tables:
+                error_key = (key, None)
+            message = f"{link_file_name(link_target)}: {type(exc).__name__}: {exc}"
+            self._family_read_errors[error_key] = message
+            self._report(f"Family read failed (cached for this run): {message}")
+            raise
+
+    def _capture_family(self, link_target):
+        from excel_capture import capture_family
+
+        if self._excel_blocked_message:
+            raise RuntimeError(self._excel_blocked_message)
+        if "://" in link_target or os.path.isabs(link_target):
+            url = excel_document_url("", link_target)
+        else:
+            if self._index2_folder is None:
+                self.get_index2_map()
+            if not self._index2_folder:
+                raise RuntimeError("Index2's live folder could not be resolved.")
+            url = excel_document_url(self._index2_folder, link_target)
+        self._report(f"Opening {link_file_name(link_target)} (limit {self.FAMILY_CAPTURE_TIMEOUT}s)...")
+        try:
+            name, sheets, snapshot_bytes = capture_family(
+                url, self.FAMILY_CAPTURE_TIMEOUT, self._report,
+                assemblies=tuple(sorted(self._assembly_targets.get(link_target.upper(), ()))),
+            )
+        except TimeoutError as exc:
+            self._excel_blocked_message = (
+                f"Excel did not finish reading {link_file_name(link_target)}. "
+                "Further uncached family reads were skipped because Excel may still be blocked. "
+                "Resolve any Excel dialogs and restart the audit. Index2 has been left open."
+            )
+            self._report(str(exc))
+            raise
+        snapshot = load_workbook(BytesIO(snapshot_bytes), data_only=True)
+        return name, sheets, snapshot
+
+    def _capture_live_family(self, link_target, assemblies=()):
+        """Worker-only COM capture; the parent enforces its deadline."""
+        workbook = self.get_family_workbook(link_target)
+        try:
+            name = workbook.Name
+            roots = tuple(dict.fromkeys(split_style_number(str(value).strip().upper())[0] for value in assemblies))
+            if roots:
+                self._report(f"Finding root assemblies in {name}: {', '.join(roots)}")
+                snapshot = self._capture_root_tables(workbook, roots)
+                return name, tuple((sheet.title, tuple(sheet.values)) for sheet in snapshot.worksheets), snapshot
+            self._report(f"Reading active worksheets in {name}")
+            sheets = []
+            for sheet in workbook.Worksheets:
+                if sheet.Name.upper().startswith("OBSOLETE"):
+                    continue
+                self._report(f"Reading {name} / {sheet.Name}")
+                values = normalize_excel_rows(sheet.UsedRange.Value)
+                if values:
+                    sheets.append((sheet.Name, values))
+            self._report(f"Capturing merged cells in {name}")
+            snapshot = self._snapshot_workbook(workbook, dict(sheets))
+            return name, tuple(sheets), snapshot
+        finally:
+            self._close_owned_family(link_target)
+
+    def _capture_root_tables(self, workbook, roots):
+        """Find roots natively; preserve small sheets, restrict inflated sheets to root regions."""
+        snapshot = Workbook()
+        snapshot.remove(snapshot.active)
+        for sheet in workbook.Worksheets:
+            if sheet.Name.upper().startswith("OBSOLETE"):
+                continue
+            bounds = set()
+            for root in roots:
+                pattern = re.compile(rf"(?<![A-Z0-9]){re.escape(root)}(?:[GH]\d+)?(?![A-Z0-9])", re.IGNORECASE)
+                previous = None
+                seen = set()
+                while True:
+                    options = dict(
+                        What=root, LookAt=2, LookIn=-4163, SearchOrder=1,
+                        SearchDirection=1, MatchCase=False, SearchFormat=False,
+                    )
+                    if previous is not None:
+                        options["After"] = previous
+                    found = self._excel_call(f"finding {root} in {sheet.Name}", lambda: sheet.Cells.Find(**options))
+                    if found is None or (found.Row, found.Column) in seen:
+                        break
+                    seen.add((found.Row, found.Column))
+                    previous = found
+                    if not pattern.search(str(found.Value or "")):
+                        continue
+                    self._report(f"Found {root} in {workbook.Name} / {sheet.Name}, row {found.Row}")
+                    region = found.CurrentRegion
+                    top, left = region.Row, region.Column
+                    bottom = top + region.Rows.Count - 1
+                    right = left + region.Columns.Count - 1
+                    if region.Rows.Count <= found.MergeArea.Rows.Count and bottom < sheet.Rows.Count:
+                        last_column = get_column_letter(sheet.Columns.Count)
+                        search = sheet.Range(
+                            f"A{bottom + 1}:{last_column}{min(sheet.Rows.Count, bottom + 8)}"
+                        )
+                        following = search.Find(
+                            What="*", LookIn=-4163, LookAt=2, SearchOrder=1,
+                            SearchDirection=1, MatchCase=False, SearchFormat=False,
+                        )
+                        if following is not None:
+                            body = following.CurrentRegion
+                            bottom = max(bottom, body.Row + body.Rows.Count - 1)
+                            left = min(left, body.Column)
+                            right = max(right, body.Column + body.Columns.Count - 1)
+                    bounds.add((max(1, top - CONTEXT_LOOKBACK), left, bottom, right))
+            if bounds and self._copy_small_sheet(sheet, snapshot):
+                continue
+            blocks = []
+            for top, left, bottom, right in sorted(bounds):
+                if blocks and top <= blocks[-1][2] and left <= blocks[-1][3] and right >= blocks[-1][1]:
+                    a, b, c, d = blocks.pop()
+                    top, left, bottom, right = min(top, a), min(left, b), max(bottom, c), max(right, d)
+                blocks.append((top, left, bottom, right))
+            if not blocks:
+                continue
+            target = snapshot.create_sheet(sheet.Name)
+            cursor = 1
+            for top, left, bottom, right in blocks:
+                while True:
+                    region = sheet.Range(f"{get_column_letter(left)}{top}:{get_column_letter(right)}{bottom}")
+                    rows = normalize_excel_rows(region.Value)
+                    merged = self._merged_ranges(sheet, region, rows)
+                    expanded = (
+                        min([top] + [a for a, _b, _c, _d in merged]),
+                        min([left] + [b for _a, b, _c, _d in merged]),
+                        max([bottom] + [c for _a, _b, c, _d in merged]),
+                        max([right] + [d for _a, _b, _c, d in merged]),
+                    )
+                    if expanded == (top, left, bottom, right):
+                        break
+                    top, left, bottom, right = expanded
+                for offset, row in enumerate(rows):
+                    for column, value in enumerate(row, start=left):
+                        if value is not None:
+                            target.cell(cursor + offset, column, snapshot_cell_value(value))
+                for a, b, c, d in merged:
+                    target.merge_cells(
+                        start_row=cursor + a - top, start_column=b,
+                        end_row=cursor + c - top, end_column=d,
+                    )
+                cursor += len(rows) + 2
+        if not snapshot.worksheets:
+            notices = []
+            for sheet in workbook.Worksheets:
+                if not sheet.Name.upper().startswith("OBSOLETE"):
+                    values = normalize_excel_rows(sheet.Range("A1:Z40").Value)
+                    notices.append((sheet.Name, values))
+            if workbook_migration(notices) is None:
+                snapshot.close()
+                raise LookupError(f"Root assemblies {', '.join(roots)} were not found in {workbook.Name}.")
+            for name, rows in notices:
+                target = snapshot.create_sheet(name)
+                for row in rows:
+                    target.append(row)
+        return snapshot
+
+    def prepare_assembly_targets(self, sections, index_map):
+        for _num, _title, items in sections:
+            for style, _description, _width, _depth in items:
+                base, _group = split_style_number(style)
+                link = index_map.get(base.upper())
+                if link:
+                    self._assembly_targets.setdefault(link.upper(), set()).add(base.upper())
+
+    def _read_group_tables(self, link_target, _visited=(), assembly_base=None):
         """Group-bearing tables from every active sheet of the family workbook, cached."""
 
         key = link_target.upper()
@@ -2081,50 +2901,136 @@ class ExcelComSession:
             raise RuntimeError("Replacement workbook cycle detected.")
 
         if key not in self._group_tables:
-            workbook = self.get_family_workbook(link_target)
-            tables = []
-            sheets = []
-            for sheet in workbook.Worksheets:
-                if sheet.Name.upper().startswith("OBSOLETE"):
-                    continue
-                values = sheet.UsedRange.Value
-                if isinstance(values, tuple):
-                    sheets.append((sheet.Name, values))
-                    tables.extend(WorkbookParser.extract_tables(values, sheet.Name))
+            name, sheets, snapshot = self._capture_family(link_target)
+            self._source_names[key] = name
+            self._classifier_snapshots[key] = snapshot
+            self._captured_roots[key] = frozenset(self._assembly_targets.get(key, ()))
+            tables = [
+                table for sheet_name, values in sheets
+                for table in WorkbookParser.extract_tables(values, sheet_name)
+            ]
             migration = workbook_migration(sheets)
             if not any(any(_cell_text(value) for row in rows for value in row) for _name, rows in sheets):
-                raise RuntimeError(f"{workbook.Name} has no readable active table data. Cannot determine a group.")
+                raise RuntimeError(f"{self._source_names[key]} has no readable active table data. Cannot determine a group.")
             if migration is not None:
                 target, notice = migration
                 if not target:
                     raise RuntimeError(f"Workbook retired: {notice}. Current smart workbook must be identified in Index2.")
-                index = self._get_index2_workbook()
-                target_name = normalize_code(os.path.splitext(link_file_name(target))[0])
-                candidates = set()
-                for hyperlink in index.Worksheets(1).Hyperlinks:
-                    if hyperlink.Range.Column != 5:
-                        continue
-                    name = normalize_code(os.path.splitext(str(hyperlink.Range.Value or ""))[0])
-                    address = str(hyperlink.Address or "")
-                    if name == target_name or normalize_code(os.path.splitext(link_file_name(address))[0]) == target_name:
-                        candidates.add(address)
-                if len(candidates) != 1:
-                    raise RuntimeError(f"Replacement {target} has no unique Index2 link. {notice}")
-                replacement = next(iter(candidates))
-                if replacement.startswith("../"):
-                    from urllib.parse import urljoin
-                    replacement = urljoin(str(index.Path).rstrip("/") + "/", replacement)
+                replacement = self._replacement_link(target, notice, link_target)
+                self._assembly_targets.setdefault(replacement.upper(), set()).update(
+                    self._assembly_targets.get(key, ())
+                )
                 replacement_tables = self.get_group_tables(replacement, (*_visited, key))
                 self._group_tables[key] = replacement_tables
                 self._sheet_values[key] = tuple(
                     (f"{link_file_name(replacement)} / {sheet_name}", rows)
                     for sheet_name, rows in self._sheet_values[replacement.upper()]
                 )
-                return replacement_tables
-            self._group_tables[key] = tuple(tables)
-            self._sheet_values[key] = tuple(sheets)
+                self._classifier_snapshots[key].close()
+                self._classifier_snapshots[key] = self._classifier_snapshots[replacement.upper()]
+                self._source_names[key] = self._source_names[replacement.upper()]
+            else:
+                self._group_tables[key] = tuple(tables)
+                self._sheet_values[key] = tuple(sheets)
 
+        if assembly_base:
+            cache_key = (key, assembly_base.upper())
+            if cache_key not in self._classifier_tables:
+                if key not in self._classifier_parsers:
+                    from Classifier import WorkbookAssemblyParser
+                    self._classifier_parsers[key] = WorkbookAssemblyParser(
+                        self._source_names[key], METADATA_PATH, SEMANTIC_PATH, self._classifier_snapshots[key],
+                    )
+                self._report(f"Classifying {assembly_base} in {self._source_names[key]}...")
+                self._classifier_tables[cache_key] = ClassifierWorkbookParser.extract_tables(
+                    self._classifier_snapshots[key], self._source_names[key], assembly_base,
+                    parser=self._classifier_parsers[key],
+                )
+            classified = self._classifier_tables[cache_key]
+            if classified:
+                return classified
+            self._report(f"Classifier found no configurations for {assembly_base}; using existing table readers.")
         return self._group_tables[key]
+
+    def _copy_small_sheet(self, sheet, snapshot):
+        """Keep a complete family sheet in place: neighbouring tables and titles decide ownership.
+
+        Packing only the regions around a root cut table titles and merged headers away and let
+        another root's table (same columns, adjacent rows) be mistaken for this root's table.
+        """
+        used = sheet.UsedRange
+        if used.Rows.Count * used.Columns.Count > FULL_SHEET_CELL_LIMIT:
+            return False
+        rows = normalize_excel_rows(used.Value)
+        target = snapshot.create_sheet(sheet.Name)
+        for row_index, row in enumerate(rows, start=used.Row):
+            for column_index, value in enumerate(row, start=used.Column):
+                if value is not None:
+                    target.cell(row_index, column_index, snapshot_cell_value(value))
+        for top, left, bottom, right in self._merged_ranges(sheet, used, rows):
+            target.merge_cells(start_row=top, start_column=left, end_row=bottom, end_column=right)
+        return True
+
+    @staticmethod
+    def _snapshot_workbook(workbook, sheet_rows=None):
+        """Copy live values and merge geometry, including UsedRange's row/column offset."""
+        if Workbook is None:
+            raise RuntimeError("openpyxl is not installed.")
+        snapshot = Workbook()
+        snapshot.remove(snapshot.active)
+        for sheet in workbook.Worksheets:
+            if sheet.Name.upper().startswith("OBSOLETE"):
+                continue
+            target = snapshot.create_sheet(sheet.Name)
+            used = sheet.UsedRange
+            rows = sheet_rows.get(sheet.Name, ()) if sheet_rows is not None else normalize_excel_rows(used.Value)
+            for row_index, row in enumerate(rows, start=used.Row):
+                for column_index, value in enumerate(row, start=used.Column):
+                    if value is None:
+                        continue
+                    target.cell(row_index, column_index, snapshot_cell_value(value))
+            for top, left, bottom, right in ExcelComSession._merged_ranges(sheet, used, rows):
+                target.merge_cells(start_row=top, start_column=left, end_row=bottom, end_column=right)
+        return snapshot
+
+    @staticmethod
+    def _merged_ranges(sheet, used, rows):
+        """Skip unmerged blocks in one COM call instead of probing every cell."""
+        if used.MergeCells is False:
+            return ()
+        populated = [(r, c) for r, row in enumerate(rows) for c, value in enumerate(row) if value is not None]
+        if not populated:
+            return ()
+        pending = [(
+            used.Row + min(r for r, _c in populated),
+            used.Column + min(c for _r, c in populated),
+            used.Row + max(r for r, _c in populated),
+            used.Column + max(c for _r, c in populated),
+        )]
+        merged = set()
+        while pending:
+            top, left, bottom, right = pending.pop()
+            if any(a <= top and b <= left and c >= bottom and d >= right for a, b, c, d in merged):
+                continue
+            address = f"{get_column_letter(left)}{top}:{get_column_letter(right)}{bottom}"
+            state = sheet.Range(address).MergeCells
+            if state is False:
+                continue
+            if state is True:
+                area = sheet.Cells(top, left).MergeArea
+                bounds = (area.Row, area.Column, area.Row + area.Rows.Count - 1, area.Column + area.Columns.Count - 1)
+                merged.add(bounds)
+                if bounds[0] <= top and bounds[1] <= left and bounds[2] >= bottom and bounds[3] >= right:
+                    continue
+            if top == bottom and left == right:
+                raise RuntimeError(f"Could not resolve merged cell {sheet.Name}!{address}.")
+            if bottom - top >= right - left:
+                middle = (top + bottom) // 2
+                pending.extend(((top, left, middle, right), (middle + 1, left, bottom, right)))
+            else:
+                middle = (left + right) // 2
+                pending.extend(((top, left, bottom, middle), (top, middle + 1, bottom, right)))
+        return merged
 
     def get_sheet_values(self, link_target):
         """[(sheet name, values)] of the family workbook's active sheets."""
@@ -2135,11 +3041,26 @@ class ExcelComSession:
 
     def close(self):
 
+        for link_target in tuple(self._family_workbooks):
+            self._close_owned_family(link_target)
+        for snapshot in self._classifier_snapshots.values():
+            snapshot.close()
+        self._classifier_snapshots.clear()
+        self._classifier_tables.clear()
+        self._classifier_parsers.clear()
+        self._family_read_errors.clear()
+        self._index2_folder = None
+        self._replacement_links = None
+        self._excel_blocked_message = ""
+        self._assembly_targets.clear()
+        self._captured_roots.clear()
+        self._source_names.clear()
         self._group_tables.clear()
         self._sheet_values.clear()
         self._app = None
         self._index2_wb = None
         self._index2_map = None
+        self._index2_catalog = None
         self._family_workbooks.clear()
 
 
@@ -2228,11 +3149,18 @@ class AuditReviewDemo(QMainWindow):
         self._assembly_families = {}
         self._assembly_links = {}
         self._validation_results = {}
+        self._validation_checks = {}
+        self._coverage_expected_checks = {}
         self._dimension_lookup_error = None
         self._code_mappings = {}
         self._pending_folder = None
         self._pdf_read_issues = []
         self._pdf_ocr_page_count = 0
+        self._coverage_catalog = None
+        self._coverage_indexed_roots = set()
+        self._coverage_linked_roots = set()
+        self._coverage_job_roots = {}
+        self._coverage_excluded_styles = set()
 
         self.browse_pdf_btn.clicked.connect(self.browse_job_folder)
         self.start_btn.clicked.connect(self.start_automation)
@@ -2347,26 +3275,36 @@ class AuditReviewDemo(QMainWindow):
 
         summary = QFrame()
         summary.setObjectName("summary")
-        metrics = QHBoxLayout(summary)
-        metrics.setContentsMargins(0, 0, 0, 0)
-        metrics.setSpacing(10)
+        metric_rows = QVBoxLayout(summary)
+        metric_rows.setContentsMargins(0, 0, 0, 0)
         self.summary_labels = {}
-        for key, title in (("total", "ASSEMBLIES"), ("mapped", "MAPPED"), ("PASS", "PASS"), ("FAIL", "FAIL"), ("UNRESOLVED", "UNRESOLVED")):
-            card = QFrame()
-            card.setObjectName("card" + key)
-            card.setProperty("metricCard", True)
-            metric = QVBoxLayout(card)
-            metric.setContentsMargins(14, 10, 14, 10)
-            metric.setSpacing(3)
-            number = QLabel("0")
-            number.setObjectName("metric" + key)
-            number.setProperty("metric", True)
-            caption = QLabel(title)
-            caption.setObjectName("metricCaption")
-            metric.addWidget(number)
-            metric.addWidget(caption)
-            metrics.addWidget(card, 1)
-            self.summary_labels[key] = number
+        for definitions in (
+            (("all_assemblies", "ALL BOLD ASSEMBLIES"), ("gh_assemblies", "G/H ASSEMBLIES"),
+             ("present", "G/H IN INDEX2"), ("missing", "G/H NOT IN INDEX2"),
+             ("coverage_rate", "INDEX2 PRESENCE RATE")),
+            (("validation_total", "G/H VALIDATION TOTAL"), ("PASS", "PASS"), ("FAIL", "FAIL"),
+             ("UNRESOLVED", "UNRESOLVED"), ("validation_rate", "VALIDATION PASS RATE")),
+        ):
+            metrics = QHBoxLayout()
+            metrics.setSpacing(10)
+            for key, title in definitions:
+                card = QFrame()
+                card.setObjectName("card" + key)
+                card.setProperty("metricCard", True)
+                metric = QVBoxLayout(card)
+                metric.setContentsMargins(14, 10, 14, 10)
+                metric.setSpacing(3)
+                number = QLabel("0")
+                number.setObjectName("metric" + key)
+                number.setProperty("metric", True)
+                caption = QLabel(title)
+                caption.setObjectName("metricCaption")
+                caption.setWordWrap(True)
+                metric.addWidget(number)
+                metric.addWidget(caption)
+                metrics.addWidget(card, 1)
+                self.summary_labels[key] = number
+            metric_rows.addLayout(metrics)
         content.addWidget(summary)
 
         self.centerGroup.setTitle("")
@@ -2378,13 +3316,25 @@ class AuditReviewDemo(QMainWindow):
         self.audit_search.setAccessibleName("Search audit assemblies")
         self.audit_search.setMinimumWidth(180)
         self.status_filter = QComboBox()
-        self.status_filter.addItems(["All statuses", "PASS", "FAIL", "UNRESOLVED"])
-        self.status_filter.setAccessibleName("Filter audit status")
+        self.status_filter.addItems(["All statuses", "PASS", "FAIL", "UNRESOLVED", "EXCLUDED"])
+        self.status_filter.setAccessibleName("Filter overall assembly validation result")
+        self.status_filter.setToolTip(
+            "Filters the overall result for each unique G/H assembly present in Index2. "
+            "All its structure rows are shown as evidence: any FAIL wins; all checks must PASS; otherwise UNRESOLVED."
+        )
         self.status_filter.setMinimumWidth(138)
+        self.audit_coverage_filter = QComboBox()
+        self.audit_coverage_filter.addItems([
+            "All Index2 coverage", "Present in Index2", "Present with link", "Not linked",
+            "Listed without link", "Not present in Index2", "Not checked", "Excluded (no G/H suffix)",
+        ])
+        self.audit_coverage_filter.setAccessibleName("Filter audit Index2 root links")
+        self.audit_suffix_filter = QComboBox()
+        self.audit_suffix_filter.addItems(["All bold assemblies", "G/H assemblies", "Without G/H suffix"])
+        self.audit_suffix_filter.setAccessibleName("Filter bold assemblies by G/H suffix")
         self.parameter_toggle = QCheckBox("Parameter columns")
         toolbar.addWidget(self.audit_search, 1)
         toolbar.addWidget(self.status_filter)
-        toolbar.addWidget(self.parameter_toggle)
         for title, icon, action in (
             ("Expand structures", QStyle.StandardPixmap.SP_ArrowDown, self.bom_list.expandAll),
             ("Collapse structures", QStyle.StandardPixmap.SP_ArrowUp, self.bom_list.collapseAll),
@@ -2397,9 +3347,19 @@ class AuditReviewDemo(QMainWindow):
             button.clicked.connect(action)
             toolbar.addWidget(button)
         self.centerLayout.insertLayout(0, toolbar)
+        coverage_filters = QHBoxLayout()
+        coverage_filters.addWidget(self.audit_suffix_filter)
+        coverage_filters.addWidget(self.audit_coverage_filter)
+        coverage_filters.addWidget(self.parameter_toggle)
+        coverage_filters.addStretch()
+        self.centerLayout.insertLayout(1, coverage_filters)
         self.visible_rows = QLabel("0 assemblies")
         self.visible_rows.setObjectName("metricCaption")
-        self.centerLayout.insertWidget(1, self.visible_rows)
+        self.centerLayout.insertWidget(2, self.visible_rows)
+        self.audit_coverage_summary = QLabel()
+        self.audit_coverage_summary.setWordWrap(True)
+        self.audit_coverage_summary.setObjectName("metricCaption")
+        self.centerLayout.insertWidget(3, self.audit_coverage_summary)
         self.bom_list.setUniformRowHeights(True)
         self.bom_list.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
         self.bom_list.setHorizontalScrollMode(QAbstractItemView.ScrollMode.ScrollPerPixel)
@@ -2410,11 +3370,14 @@ class AuditReviewDemo(QMainWindow):
         self.row_details = QPlainTextEdit()
         self.row_details.setReadOnly(True)
         self.row_details.setPlaceholderText("Assembly details")
-        self.row_details.setFixedHeight(118)
+        self.row_details.setMinimumHeight(60)
+        self.row_details.setMaximumHeight(118)
         self.centerLayout.addWidget(self.row_details)
         self.bom_list.currentItemChanged.connect(self._show_row_details)
         self.audit_search.textChanged.connect(self._apply_audit_filters)
         self.status_filter.currentIndexChanged.connect(self._apply_audit_filters)
+        self.audit_coverage_filter.currentIndexChanged.connect(self._apply_audit_filters)
+        self.audit_suffix_filter.currentIndexChanged.connect(self._apply_audit_filters)
         self.parameter_toggle.toggled.connect(self._toggle_parameter_columns)
         self.main_tabs.tabBar().hide()
         self._tab_opacity = QGraphicsOpacityEffect(self.main_tabs)
@@ -2425,13 +3388,38 @@ class AuditReviewDemo(QMainWindow):
         self.main_tabs.currentChanged.connect(self._animate_workspace)
         self._workspace_revealed = False
         content.addWidget(self.main_tabs, 1)
+        run_status = QHBoxLayout()
+        self.run_indicator = QLabel("Ready - select a job folder to begin")
+        self.run_indicator.setObjectName("runIndicator")
+        self.run_indicator.setTextFormat(Qt.TextFormat.PlainText)
+        self.run_indicator.setWordWrap(True)
+        self.run_indicator.setAccessibleName("Automation run state")
+        run_status.addWidget(self.run_indicator, 1)
+        self.run_busy_bar = QProgressBar()
+        self.run_busy_bar.setAccessibleName("Automation in progress")
+        self.run_busy_bar.setRange(0, 0)
+        self.run_busy_bar.setTextVisible(False)
+        self.run_busy_bar.setFixedSize(100, 8)
+        self.run_busy_bar.hide()
+        run_status.addWidget(self.run_busy_bar)
+        content.addLayout(run_status)
+        self._run_started_at = None
+        self._run_tick = 0
+        self._run_timer = QTimer(self)
+        self._run_timer.setInterval(250)
+        self._run_timer.timeout.connect(self._refresh_running_indicator)
         self.scan_status.setWordWrap(True)
         self.scan_status.setMaximumHeight(54)
         self.scan_status.setMinimumWidth(0)
         content.addWidget(self.scan_status)
         self.progress.setFixedHeight(22)
         content.addWidget(self.progress)
-        root.addWidget(workspace, 1)
+        self.workspace_scroll = QScrollArea()
+        self.workspace_scroll.setFrameShape(QFrame.Shape.NoFrame)
+        self.workspace_scroll.setWidgetResizable(True)
+        self.workspace_scroll.setAccessibleName("Scrollable audit workspace")
+        self.workspace_scroll.setWidget(workspace)
+        root.addWidget(self.workspace_scroll, 1)
         self.setCentralWidget(central)
         self.menubar.hide()
         self.statusbar.hide()
@@ -2459,20 +3447,43 @@ class AuditReviewDemo(QMainWindow):
         query = self.audit_search.text().strip().casefold()
         status = self.status_filter.currentText()
         visible = 0
+        row_count = 0
+        filtered_styles = set()
+        coverage = self.audit_coverage_filter.currentText()
+        suffix_scope = self.audit_suffix_filter.currentIndex()
+        outcomes = self._eligible_assembly_results()
         for section_index in range(self.bom_list.topLevelItemCount()):
             section = self.bom_list.topLevelItem(section_index)
             section_visible = False
             for index in range(section.childCount()):
                 item = section.child(index)
+                row_count += 1
                 matches = (not query or query in " ".join(item.text(column) for column in range(item.columnCount())).casefold())
-                matches = matches and (status == "All statuses" or item.text(item.columnCount() - 1) == status)
+                style = item.text(0).strip().upper()
+                overall = self._overall_assembly_status(style, outcomes)
+                matches = matches and (status == "All statuses" or overall == status)
+                root = self._coverage_root(item.text(0))
+                matches = matches and (
+                    suffix_scope == 0 or suffix_scope == 1 and root is not None
+                    or suffix_scope == 2 and root is None
+                )
+                root_status = self._index2_root_status(root) if root else "Excluded (no G/H suffix)"
+                matches = matches and self._matches_index2_filter(root_status, coverage)
                 item.setHidden(not matches)
                 section_visible = section_visible or matches
                 visible += int(matches)
+                if matches:
+                    filtered_styles.add(item.text(0))
             section.setHidden(not section_visible)
-            if section_visible and (query or status != "All statuses"):
+            if section_visible and (query or status != "All statuses" or coverage != "All Index2 coverage" or suffix_scope):
                 section.setExpanded(True)
-        self.visible_rows.setText(f"{visible} of {len(self.checkbox_items)} assemblies")
+        if row_count == len(self.checkbox_items):
+            self.visible_rows.setText(f"{visible} of {row_count} assembly rows")
+        else:
+            self.visible_rows.setText(
+                f"{visible} of {row_count} PDF rows ({len(self.checkbox_items)} unique assembly/structure pairs)"
+            )
+        self.audit_coverage_summary.setText(self._assembly_coverage_summary(filtered_styles))
 
     def _show_row_details(self, item=None, previous=None):
         if item is None or item.parent() is None:
@@ -2480,6 +3491,18 @@ class AuditReviewDemo(QMainWindow):
             return
         status_column = item.columnCount() - 1
         lines = [f"{item.text(0)}  |  {item.text(1)}", item.toolTip(status_column)]
+        overall = self._overall_assembly_status(item.text(0).strip().upper(), self._eligible_assembly_results())
+        lines.append(
+            f"Overall assembly result: {overall}. Any structure FAIL gives FAIL; "
+            "all checks must PASS; otherwise UNRESOLVED. Table results are per structure."
+        )
+        root = self._coverage_root(item.text(0))
+        lines.append(
+            f"Index2 root {root}: {self._index2_root_status(root)}" if root
+            else "Excluded from root coverage: no G/H suffix."
+        )
+        links = sorted({entry.link for entry in self._coverage_catalog or () if entry.root == root and entry.link})
+        lines.extend(links)
         lines.extend(item.text(column) for column in range(4, 4 + self._parameter_columns) if item.text(column))
         self.row_details.setPlainText("\n".join(lines))
 
@@ -2524,6 +3547,187 @@ class AuditReviewDemo(QMainWindow):
         self.main_tabs.addTab(page, "Testing")
         parent_layout.insertWidget(index, self.main_tabs)
 
+    def _set_index2_job_sections(self, sections):
+        self._coverage_job_roots = {}
+        self._coverage_excluded_styles = set()
+        self._coverage_expected_checks.clear()
+        self._validation_checks.clear()
+        for number, _title, items in sections:
+            for style, _description, _width, _depth in items:
+                style = style.strip().upper()
+                base = self._coverage_root(style)
+                if base is None:
+                    self._coverage_excluded_styles.add(style)
+                    continue
+                entry = self._coverage_job_roots.setdefault(base, {"styles": set(), "sections": set()})
+                entry["styles"].add(style)
+                entry["sections"].add(str(number))
+                self._coverage_expected_checks[style] = self._coverage_expected_checks.get(style, 0) + 1
+        self._update_index2_coverage()
+
+    @staticmethod
+    def _coverage_root(style):
+        base, suffix = split_style_number(style.strip().upper())
+        return base if re.fullmatch(r"[GH]\d+", suffix) else None
+
+    def _index2_root_status(self, root):
+        if self._coverage_catalog is None:
+            return "Not checked"
+        if root in self._coverage_linked_roots:
+            return "Present with link"
+        if root in self._coverage_indexed_roots:
+            return "Listed without link"
+        return "Not present in Index2"
+
+    @staticmethod
+    def _matches_index2_filter(actual, selected):
+        return (
+            selected in ("All coverage", "All Index2 coverage") or actual == selected
+            or selected == "Present in Index2" and actual in ("Present with link", "Listed without link")
+            or selected == "Not linked" and actual in ("Listed without link", "Not present in Index2")
+        )
+
+    def _assembly_coverage_counts(self, styles):
+        styles = {style.strip().upper() for style in styles}
+        grouped = {style: root for style in styles if (root := self._coverage_root(style)) is not None}
+        present = sum(root in self._coverage_indexed_roots for root in grouped.values())
+        return len(styles), len(grouped), present
+
+    def _assembly_coverage_summary(self, styles):
+        total, grouped, present = self._assembly_coverage_counts(styles)
+        loaded = self._coverage_catalog is not None
+        rate = f"{present / grouped:.1%}" if loaded and grouped else "--"
+        return (
+            f"Filtered unique assemblies: {total} | G/H: {grouped} | Without G/H: {total - grouped} | "
+            f"In Index2: {present if loaded else '--'} | "
+            f"Not present: {grouped - present if loaded else '--'} | Presence rate: {rate}"
+        )
+
+    def _eligible_assembly_results(self):
+        if self._coverage_catalog is None:
+            return None
+        outcomes = {}
+        for root, entry in self._coverage_job_roots.items():
+            if root not in self._coverage_indexed_roots:
+                continue
+            for style in entry["styles"]:
+                checks = self._validation_checks.get(style, ())
+                if "FAIL" in checks:
+                    outcomes[style] = "FAIL"
+                elif len(checks) == self._coverage_expected_checks[style] and all(check == "PASS" for check in checks):
+                    outcomes[style] = "PASS"
+                else:
+                    outcomes[style] = "UNRESOLVED"
+        return outcomes
+
+    def _overall_assembly_status(self, style, outcomes):
+        if self._coverage_root(style) is None:
+            return "EXCLUDED"
+        if outcomes is None:
+            return "UNRESOLVED"
+        return outcomes.get(style, "EXCLUDED")
+
+    def _validation_scope_result(self, style):
+        root = self._coverage_root(style)
+        expected = split_style_number(style)[1]
+        if root is None:
+            return ValidationResult(expected, "", "EXCLUDED", "Outside validation scope: no G/H group suffix.")
+        if self._coverage_catalog is None:
+            return ValidationResult(expected, "", "UNRESOLVED", "Index2 presence has not been checked; validation not run.")
+        if root not in self._coverage_indexed_roots:
+            return ValidationResult(expected, "", "EXCLUDED", f"Outside validation scope: root {root} is not present in Index2.")
+        if root not in self._coverage_linked_roots:
+            return ValidationResult(expected, "", "UNRESOLVED", f"Root {root} is present in Index2 but has no workbook link.")
+        return None
+
+    def _update_validation_metrics(self):
+        outcomes = self._eligible_assembly_results()
+        loaded = outcomes is not None
+        statuses = list(outcomes.values()) if loaded else []
+        total = len(statuses)
+        values = {
+            "validation_total": str(total) if loaded else "--",
+            "validation_rate": f"{statuses.count('PASS') / total:.1%}" if loaded and total else "--",
+            **{status: str(statuses.count(status)) if loaded else "--" for status in ("PASS", "FAIL", "UNRESOLVED")},
+        }
+        explanation = (
+            "Unique full G/H assembly numbers whose roots are present in Index2. "
+            "Any failed structure check gives FAIL. All expected checks must PASS to give PASS. "
+            "Missing, pending, or ambiguous checks give UNRESOLVED. "
+            "PASS + FAIL + UNRESOLVED equals G/H in Index2. Pass rate = PASS / this total. "
+            "Assemblies absent from Index2 or without G/H are excluded."
+        )
+        for key, value in values.items():
+            self.summary_labels[key].setText(value)
+            self.summary_labels[key].setToolTip(explanation)
+
+    def _update_coverage_metrics(self):
+        if not hasattr(self, "summary_labels"):
+            return
+        styles = self._coverage_excluded_styles | {
+            style for entry in self._coverage_job_roots.values() for style in entry["styles"]
+        }
+        total, grouped, present = self._assembly_coverage_counts(styles)
+        loaded = self._coverage_catalog is not None
+        values = {
+            "all_assemblies": str(total),
+            "gh_assemblies": str(grouped),
+            "present": str(present) if loaded else "--",
+            "missing": str(grouped - present) if loaded else "--",
+            "coverage_rate": f"{present / grouped:.1%}" if loaded and grouped else "--",
+        }
+        explanation = (
+            "Unique full assembly numbers from bold top-level PDF rows in the selected job scope; "
+            "repeated occurrences across structures count once. G04 and G05 count separately, "
+            "but their common root is searched in Index2 column K. "
+            "Presence rate = G/H assemblies whose root is listed / all G/H assemblies. "
+            "A listed root counts as present even without a workbook link; this is not PASS/FAIL. "
+            f"{total - grouped} unique assemblies without a G/H suffix are included in All, not in G/H. "
+            "Top cards are independent of table filters."
+        )
+        for key, value in values.items():
+            self.summary_labels[key].setText(value)
+            self.summary_labels[key].setToolTip(explanation)
+        self.summary_labels["missing"].setToolTip(
+            "Unique full G/H assembly numbers whose roots are absent from Index2 column K. "
+            "A listed root without a workbook link is not counted here. "
+            "Choose 'Not present in Index2' to show the corresponding full assemblies."
+        )
+        self._update_validation_metrics()
+
+    def refresh_index2_coverage(self):
+        """Refresh the Checklist's Index2 inventory without changing validation caches."""
+        controls = (self.start_btn, self.browse_pdf_btn)
+        enabled = [control.isEnabled() for control in controls]
+        for control in controls:
+            control.setEnabled(False)
+        try:
+            self._set_status("Reading Index2 root coverage...")
+            self._coverage_catalog = self._excel_com.get_index2_catalog(refresh=True)
+            root_count = len({entry.root for entry in self._coverage_catalog})
+            self._set_status(f"Index2 coverage updated: {root_count} unique roots.")
+        except Exception as exc:
+            self._coverage_catalog = None
+            message = f"Index2 coverage unavailable: {type(exc).__name__}: {exc}"
+            self._set_status(message)
+        finally:
+            self._update_index2_coverage()
+            for control, was_enabled in zip(controls, enabled):
+                control.setEnabled(was_enabled)
+
+    def _update_index2_coverage(self):
+        catalog = {}
+        for entry in self._coverage_catalog or ():
+            catalog.setdefault(entry.root, []).append(entry)
+        indexed = set(catalog)
+        no_links = {root for root, entries in catalog.items() if not any(entry.link for entry in entries)}
+        self._coverage_indexed_roots = indexed
+        self._coverage_linked_roots = indexed - no_links
+        self._update_coverage_metrics()
+        if hasattr(self, "audit_coverage_filter"):
+            self._apply_audit_filters()
+            self._show_row_details(self.bom_list.currentItem())
+
     def print_parameter_value(self):
 
         query = self.test_query.text().strip()
@@ -2551,7 +3755,7 @@ class AuditReviewDemo(QMainWindow):
         self.bom_list.setHeaderLabels([
             "Assembly", "Description", "Name", "Code",
             *(f"Parameter {number}" for number in range(1, parameter_count + 1)),
-            "Expected Group", "Actual Group", "Status",
+            "Expected Group", "Actual Group", "Structure result",
         ])
 
         for column, width in enumerate((155, 210, 220, 130)):
@@ -2565,6 +3769,25 @@ class AuditReviewDemo(QMainWindow):
             header.moveSection(header.visualIndex(column), position)
         if hasattr(self, "parameter_toggle"):
             self._toggle_parameter_columns()
+
+    def _ensure_parameter_columns(self, parameter_count):
+        if parameter_count <= self._parameter_columns:
+            return
+        old_offset = 4 + self._parameter_columns
+        previous = [
+            (item, tuple((item.text(i), item.toolTip(i), item.foreground(i)) for i in range(old_offset, old_offset + 3)))
+            for item in self.checkbox_items.values()
+        ]
+        self._configure_columns(parameter_count)
+        for item, status_cells in previous:
+            for column in range(old_offset, 4 + parameter_count):
+                item.setText(column, "")
+                item.setToolTip(column, "")
+                item.setForeground(column, QBrush())
+            for column, (text, tip, brush) in enumerate(status_cells, start=4 + parameter_count):
+                item.setText(column, text)
+                item.setToolTip(column, tip)
+                item.setForeground(column, brush)
 
     # ------------------------------------------------------------------
     # PDF reading
@@ -2646,24 +3869,61 @@ class AuditReviewDemo(QMainWindow):
 
     def start_automation(self):
 
-        if not self._pending_folder:
+        if not self._pending_folder or self._run_timer.isActive():
             return
 
         self.browse_pdf_btn.setEnabled(False)
         self.start_btn.setEnabled(False)
+        self.start_btn.setText("Running...")
         self.test_scope_checkbox.setEnabled(False)
+        self._run_started_at = time.monotonic()
+        self._run_tick = 0
+        self.run_busy_bar.show()
+        self._run_timer.start()
+        self._refresh_running_indicator()
         QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
 
         try:
-            self._run_automation(self._pending_folder)
+            self._set_status("Starting automation. Please wait...")
+            completed = self._run_automation(self._pending_folder)
+            self._set_run_outcome(
+                "Completed - review the audit results" if completed
+                else "Needs attention - automation did not complete; see activity log",
+                "completed" if completed else "attention",
+            )
         except Exception as exc:
+            self._set_run_outcome("Failed - see activity log for the error", "failed")
             self._set_status(f"Automation failed: {type(exc).__name__}: {exc}")
             raise
         finally:
+            self._run_timer.stop()
+            self.run_busy_bar.hide()
             QApplication.restoreOverrideCursor()
             self.browse_pdf_btn.setEnabled(True)
             self.start_btn.setEnabled(True)
+            self.start_btn.setText("Start Automation")
             self.test_scope_checkbox.setEnabled(True)
+
+    def _run_elapsed(self):
+        seconds = int(time.monotonic() - self._run_started_at) if self._run_started_at is not None else 0
+        minutes, seconds = divmod(seconds, 60)
+        return f"{minutes:02d}:{seconds:02d}"
+
+    def _refresh_running_indicator(self):
+        dots = "." * (self._run_tick % 4)
+        self._run_tick += 1
+        self._set_run_indicator(f"Running{dots}  |  Elapsed {self._run_elapsed()}  |  Please wait", "running")
+
+    def _set_run_indicator(self, text, state):
+        self.run_indicator.setText(text)
+        if self.run_indicator.property("runState") != state:
+            self.run_indicator.setProperty("runState", state)
+            self.run_indicator.style().unpolish(self.run_indicator)
+            self.run_indicator.style().polish(self.run_indicator)
+
+    def _set_run_outcome(self, text, state):
+        self._run_timer.stop()
+        self._set_run_indicator(f"{text}  |  Elapsed {self._run_elapsed()}", state)
 
     def _run_automation(self, folder):
 
@@ -2715,6 +3975,7 @@ class AuditReviewDemo(QMainWindow):
                 self._set_status(f"Structure {SCOPED_STRUCTURE} has no assembly rows.")
                 return
 
+        self._set_index2_job_sections(sections)
         quickprint_path = self._find_named_pdf(folder, "QUICKPRINT")
         parameter_sources = self._pdf_parameter_sources(bom_extraction, bom_path)
 
@@ -2753,6 +4014,8 @@ class AuditReviewDemo(QMainWindow):
         self._dimension_cache.clear()
         self._index2_map = {}
         self._excel_com.close()
+        self._coverage_catalog = None
+        self._update_index2_coverage()
 
         self._code_mappings, mapping_note = self._load_code_mappings()
         if self._code_mappings:
@@ -2777,7 +4040,15 @@ class AuditReviewDemo(QMainWindow):
             return
 
         self._parameter_repository.clear()
+        self.refresh_index2_coverage()
+        if self._coverage_catalog is None:
+            QMessageBox.warning(self, "Index2 Coverage Unavailable", "Validation was not run because Index2 presence could not be checked.")
+            self._set_status("Validation not run: Index2 presence could not be checked.")
+            return
         self._section_bus_requirements.clear()
+        self._job_dimensions = ParameterRepository()
+        self._section_dimensions = {}
+        self._section_parameters = {}
         variable_sources = [source_text for source_text, _source_name in parameter_sources]
         for source_text, source_name in parameter_sources:
             extracted = self._configuration_repository.extract_parameters(
@@ -2796,6 +4067,9 @@ class AuditReviewDemo(QMainWindow):
             try:
                 dwg_file = DWGFile(path)
                 drawing_text = dwg_file.read_text()
+                for number, parameters in dwg_file.section_parameters.items():
+                    self._section_parameters.setdefault(number, ParameterRepository()).merge_sources(parameters)
+                    self._section_dimensions.setdefault(number, ParameterRepository()).merge_sources(parameters)
                 extracted = dwg_file.extract_parameters(self._configuration_repository, drawing_text)
                 self._parameter_repository.merge_sources(extracted)
                 variable_sources.append(drawing_text)
@@ -2804,6 +4078,12 @@ class AuditReviewDemo(QMainWindow):
                 dwg_failures.append(f"{name}: {type(exc).__name__}: {exc}")
 
         for source_text, source_name in parameter_sources:
+            global_dimensions, section_dimensions = extract_job_dimensions(source_text, source_name)
+            self._job_dimensions.merge_sources(global_dimensions)
+            self._parameter_repository.merge_sources(global_dimensions)
+            for number, dimensions in section_dimensions.items():
+                self._section_dimensions.setdefault(number, ParameterRepository()).merge_sources(dimensions)
+                self._parameter_repository.merge_sources(dimensions)
             self._parameter_repository.merge_sources(extract_table_selectors(source_text, source_name))
             for number, requirements in section_bus_requirements(source_text, source_name).items():
                 self._section_bus_requirements.setdefault(number, ParameterRepository()).merge_sources(requirements)
@@ -2830,11 +4110,15 @@ class AuditReviewDemo(QMainWindow):
 
         total = len(self.checkbox_items)
         mapped = sum(bool(item.text(3)) for item in self.checkbox_items.values())
-        outcomes = [result.status for result in self._validation_results.values()]
+        assembly_outcomes = self._eligible_assembly_results()
+        if assembly_outcomes is None:
+            raise RuntimeError("Index2 presence became unavailable before validation completed.")
+        outcomes = list(assembly_outcomes.values())
         scope = f"Structure {SCOPED_STRUCTURE}" if self.test_scope_checkbox.isChecked() else "All structures"
         self._set_status(
-            f"{scope}: {total} assemblies; {mapped} matched to a checklist Code ({mapping_note}); "
-            f"validation {outcomes.count('PASS')} pass / {outcomes.count('FAIL')} fail / "
+            f"{scope}: {total} assembly/structure pairs; {mapped} matched to a checklist Code ({mapping_note}); "
+            f"validation of {len(outcomes)} unique G/H assemblies present in Index2: "
+            f"{outcomes.count('PASS')} pass / {outcomes.count('FAIL')} fail / "
             f"{outcomes.count('UNRESOLVED')} unresolved; "
             f"{self._parameter_repository.value_count} labeled parameter values from source files; "
             f"{dwg_count - len(dwg_failures)}/{dwg_count} DWGs read; "
@@ -2846,13 +4130,35 @@ class AuditReviewDemo(QMainWindow):
             QMessageBox.warning(self, "DWG Extraction Issues", "\n".join(dwg_failures))
         if self._pdf_read_issues:
             QMessageBox.warning(self, "PDF Read/OCR Issues", "\n".join(self._pdf_read_issues))
+        return True
 
     def _load_code_mappings(self):
-        """Load both parameter lists from the editable Python definitions."""
+        """Use the supplied checklist, retaining Python-only family definitions."""
 
         self._set_status("Reading checklist_parameters.py...")
         self._common_parameters = tuple(dict.fromkeys(checklist_parameters.COMMON_PARAMETERS))
-        return parse_code_mappings(checklist_parameters.CODE_WISE_PARAMETERS), "parameters: checklist_parameters.py"
+        mappings = parse_code_mappings(checklist_parameters.CODE_WISE_PARAMETERS)
+        repository = getattr(self, "_configuration_repository", None)
+        if repository is not None:
+            repository.reload()
+            checklist_mappings = repository.code_mappings()
+            for code, mapping in checklist_mappings.items():
+                existing = mappings.get(code)
+                if not mapping.parameters and existing is not None:
+                    mapping = replace(
+                        existing, manually_mapped=mapping.manually_mapped, checklist_row=mapping.checklist_row,
+                    )
+                mappings[code] = mapping
+            self._common_parameters = tuple(dict.fromkeys((
+                *self._common_parameters,
+                *(name for mapping in mappings.values() for name in mapping.parameters if name),
+            )))
+            self._set_status(
+                f"Loaded {len(checklist_mappings)} checklist families; "
+                f"{sum(mapping.manually_mapped is True for mapping in checklist_mappings.values())} marked TRUE in column N. "
+                "Automatic extraction remains enabled for other families."
+            )
+        return mappings, "parameters: checklist_parameters.py + MCOE Checklist column N"
 
     def _code_mapping_for(self, style_number, tables=()):
         """Sheet1 row whose Code equals the Index2 family workbook name, or a sheet of it
@@ -2873,6 +4179,15 @@ class AuditReviewDemo(QMainWindow):
             if mapping is not None:
                 return mapping
 
+        names = {}
+        for table in tables:
+            if table.rows_for_base(base):
+                for name in table.parameter_names:
+                    names.setdefault(ClassifierWorkbookParser.parameter_key(name), name)
+        if names:
+            family = self._assembly_families.get(style_number, "")
+            parameters = tuple(names.values())
+            return CodeMapping(family, family, parameters, parameters, False)
         return None
 
     @staticmethod
@@ -2897,9 +4212,6 @@ class AuditReviewDemo(QMainWindow):
             return record(DimensionResult(message="pywin32 (win32com) is not installed."))
 
         base, suffix = split_style_number(style_number)
-        if not suffix:
-            return record(DimensionResult(message="Assembly has no supported group suffix."))
-
         if not self._index2_map:
             if self._dimension_lookup_error:
                 return record(DimensionResult(message=self._dimension_lookup_error))
@@ -2919,6 +4231,14 @@ class AuditReviewDemo(QMainWindow):
 
         self._assembly_families[style_number] = os.path.splitext(link_file_name(link_target))[0].upper()
         self._assembly_links[style_number] = link_target
+        if not suffix:
+            try:
+                self._excel_com.get_group_tables(link_target, assembly_base=base)
+            except Exception as exc:
+                return record(DimensionResult(message=f"Lookup failed: {type(exc).__name__}: {exc}", source=link_target))
+            return record(DimensionResult(
+                message="Root table extracted; no BOM group was supplied for comparison.", source=link_target,
+            ))
 
         cache_key = (link_target.upper(), self.enclosure_sheet, base.upper(), suffix.upper())
 
@@ -2939,31 +4259,42 @@ class AuditReviewDemo(QMainWindow):
     def build_bom_checklist(self, sections):
 
         self.bom_list.blockSignals(True)
-        self.bom_list.clear()
-        self._configure_columns(max(
-            [PARAMETER_COLUMN_COUNT] + [len(mapping.parameters) for mapping in self._code_mappings.values()]
-        ))
-        self.checkbox_items.clear()
-
-        for num, title, items in sections:
-
-            if not items:
-                continue
-
-            section_item = self.add_section(f"Structure {num}: {title}")
-            structure_width, structure_depth = structure_dimensions_of(items)
-
-            for style_number, description, _width, _depth in items:
-
-                width, depth = self.lookup_dimensions(style_number)
-
-                key = f"STRUCT{num}::{style_number}"
-                self.add_checkbox(section_item, key, style_number, description, width, depth, structure_width, structure_depth, num)
-
-        self.bom_list.expandAll()
-        self.bom_list.blockSignals(False)
-
-        self.update_progress()
+        try:
+            self.bom_list.clear()
+            self._configure_columns(max(
+                [PARAMETER_COLUMN_COUNT] + [len(mapping.parameters) for mapping in self._code_mappings.values()]
+            ))
+            self.checkbox_items.clear()
+            self._validation_results.clear()
+            self._validation_checks.clear()
+            if hasattr(self, "_excel_com"):
+                targets = [
+                    (num, title, [item for item in items if self._validation_scope_result(item[0]) is None])
+                    for num, title, items in sections
+                ]
+                self._excel_com.prepare_assembly_targets(targets, self._index2_map)
+            total = sum(len(items) for _num, _title, items in sections)
+            completed = 0
+            next_update = time.monotonic()
+            for num, title, items in sections:
+                if not items:
+                    continue
+                section_item = self.add_section(f"Structure {num}: {title}")
+                section_item.setExpanded(True)
+                structure_width, structure_depth = structure_dimensions_of(items)
+                for style_number, description, _width, _depth in items:
+                    self._set_status(f"Processing assembly {completed + 1}/{total}: {style_number}")
+                    width, depth = self.lookup_dimensions(style_number) if self._validation_scope_result(style_number) is None else ("", "")
+                    key = f"STRUCT{num}::{style_number}"
+                    self.add_checkbox(section_item, key, style_number, description, width, depth, structure_width, structure_depth, num)
+                    completed += 1
+                    if time.monotonic() >= next_update:
+                        self.update_progress()
+                        next_update = time.monotonic() + 0.25
+        finally:
+            self.bom_list.expandAll()
+            self.bom_list.blockSignals(False)
+            self.update_progress()
 
     def add_section(self, text):
 
@@ -3033,28 +4364,45 @@ class AuditReviewDemo(QMainWindow):
 
         return summary, detail
 
-    def _resolved_value(self, style_number, name, width, depth):
+    def _resolved_value(self, style_number, name, width, depth, section_number=None):
+        """Resolve job values without deriving validation inputs from the existing group."""
 
         label = ConfigurationRepository._normalized(name)
+        canonical = ClassifierWorkbookParser.parameter_key(name)
+        section = getattr(self, "_section_parameters", {}).get(str(section_number))
+        if section:
+            entries = [value for parameter, found in section.parameters.items()
+                       if ClassifierWorkbookParser.parameter_key(parameter) == canonical
+                       for value, _source in found]
+            if entries:
+                return ClassifierWorkbookParser.consistent_value(entries)
 
         if label in ASSEMBLY_LABELS:
             return style_number
         if label in WIDTH_LABELS:
-            return width or ""
+            return width or dimension_value(self._dimension_entries(name, section_number))
         if label in DEPTH_LABELS:
-            return depth or ""
+            return depth or dimension_value(self._dimension_entries(name, section_number))
         if label in ENCLOSURE_LABELS:
             return self.enclosure_type or ""
 
-        if self._parameter_repository.has_conflict(name):
-            return ""
-        value = self._parameter_repository.get_parameter(name)
-        if value:
-            return value
+        entries = [value for parameter, found in self._parameter_repository.parameters.items()
+                   if ClassifierWorkbookParser.parameter_key(parameter) == canonical
+                   for value, _source in found]
+        if entries:
+            return ClassifierWorkbookParser.consistent_value(entries)
         variables = self.parameter_variables
-        parameter = variables.resolve(name)
-        found = variables.values.get(parameter, ())
-        return found[0] if len(found) == 1 else ""
+        found = [value for parameter, values in variables.values.items()
+                 if ClassifierWorkbookParser.parameter_key(parameter) == canonical for value in values]
+        return ClassifierWorkbookParser.consistent_value(found)
+
+    def _dimension_entries(self, name, section_number=None):
+        section = getattr(self, "_section_dimensions", {}).get(str(section_number))
+        entries = dimension_entries(section, name) if section else ()
+        if entries:
+            return entries
+        repository = getattr(self, "_job_dimensions", self._parameter_repository)
+        return dimension_entries(repository, name)
 
     def _family_tables(self, style_number):
         """(tables, error) of the Index2-linked family workbook for this assembly."""
@@ -3065,38 +4413,125 @@ class AuditReviewDemo(QMainWindow):
 
         try:
             self._set_status(f"Reading family tables for {style_number}...")
-            return self._excel_com.get_group_tables(link_target), ""
+            base, _group = split_style_number(style_number)
+            tables = self._excel_com.get_group_tables(link_target, assembly_base=base)
+            if any(table.classifier_type for table in tables) and self._assembly_families.get(style_number) == "BASICSTR":
+                if not self.enclosure_sheet:
+                    return (), "BASICSTR requires an enclosure type from QuickPrint."
+                selected = tuple(table for table in tables if table.sheet_name.casefold() == self.enclosure_sheet.casefold())
+                if selected:
+                    tables = selected
+                else:
+                    return (), f"Classifier: enclosure sheet {self.enclosure_sheet} was not found for {base}."
+            return tables, ""
         except Exception as exc:
             return (), f"Family tables unavailable: {type(exc).__name__}: {exc}"
 
     def validate_assembly(self, style_number, mapping, width, depth, tables, tables_error, description="", section_number=None):
         """Compares the group in the style number with the group the family workbook gives
-        for this job's parameter values (job files first, then the assembly description)."""
+        for section/assembly inputs, retaining the job's specified bus test requirement."""
 
         base, expected = split_style_number(style_number)
 
         if tables_error:
             return ValidationEngine.compare(expected, "", tables_error)
+        dimension_sources = []
+        dimension_errors = {}
+        for name, supplied in (("Width (Wide)", width), ("Depth", depth)):
+            if supplied:
+                continue
+            entries = self._dimension_entries(name, section_number) if hasattr(self, "_dimension_entries") else ()
+            if entries and not dimension_value(entries):
+                evidence = "; ".join(f"{value} [{source}]" for value, source in entries)
+                dimension_errors[normalize_code(name)] = f"Conflicting or invalid job values for {name}: {evidence}."
+            value = dimension_value(entries)
+            if value:
+                if name == "Depth":
+                    depth = value
+                else:
+                    width = value
+                dimension_sources.append(f"{name}={value} [{'; '.join(dict.fromkeys(source for _value, source in entries))}]")
         scoped = assembly_bus_requirements(getattr(self, "_section_bus_requirements", {}), section_number, description)
         if scoped and scoped.has_conflict("Heat Test/Density"):
             sources = "; ".join(f"{value}: {source}" for value, source in scoped.get_entries("Heat Test/Density"))
             return ValidationEngine.compare(expected, "", f"Conflicting section {section_number} bus requirements: {sources}")
 
         from_description = description_parameter_values(description)
-        job_material = next(iter(self.parameter_variables.values.get("Material", ())), "")
+        test_requirement = ""
+        if is_bus_description(description):
+            test_requirement = self._resolved_value(style_number, "Heat Test/Density", width, depth, section_number)
+            if "Amperage" not in from_description:
+                bus_amperage = self._resolved_value(style_number, "Bus Amperage", width, depth, section_number)
+                if bus_amperage:
+                    from_description["Amperage"] = bus_amperage
+        if scoped:
+            test_requirement = scoped.get_parameter("Heat Test/Density")
+        if test_requirement:
+            for name in tuple(from_description):
+                if ClassifierWorkbookParser.parameter_key(name) == "TEST":
+                    from_description[name] = test_requirement
+        job_material = self._resolved_value(style_number, "Material", width, depth, section_number)
         if job_material and from_description.get("Material") in ("CU", "COPPER"):
             from_description["Material"] = job_material  # the job's plating is more specific than 'CU'
-        by_key = {normalize_code(name): value for name, value in from_description.items()}
+        by_key = {ClassifierWorkbookParser.parameter_key(name): value for name, value in from_description.items()}
         values = {}
         for name in mapping.parameters if mapping else ():
             if not name or ConfigurationRepository._normalized(name) in ASSEMBLY_LABELS:
                 continue
-            value = self._resolved_value(style_number, name, width, depth) or by_key.get(normalize_code(name), "")
+            value = by_key.get(ClassifierWorkbookParser.parameter_key(name), "") or self._resolved_value(style_number, name, width, depth, section_number)
             if value:
                 values[name] = value
 
         if scoped:
             values["Heat Test/Density"] = scoped.get_parameter("Heat Test/Density")
+
+        classified = tuple(table for table in tables if table.classifier_type)
+        if classified:
+            needed = {name for table in classified for name in table.parameter_names}
+            inputs = {**from_description, **values}
+            if width:
+                inputs["Width (Wide)"] = width
+            if depth:
+                inputs["Depth"] = depth
+            for name in needed:
+                canonical = ClassifierWorkbookParser.parameter_key(name)
+                for dimension_name, error in dimension_errors.items():
+                    if ClassifierWorkbookParser.parameter_key(dimension_name) == canonical:
+                        return ValidationEngine.compare(expected, "", error)
+                repository = getattr(self, "_parameter_repository", None)
+                supplied_dimension = (
+                    canonical == "STRUCTUREWIDTH" and width
+                    or canonical == "STRUCTUREDEPTH" and depth
+                )
+                described = any(ClassifierWorkbookParser.parameter_key(key) == canonical for key in from_description)
+                if repository and not supplied_dimension and not described and not (scoped and canonical == "TEST"):
+                    entries = [
+                        entry for parameter, found in repository.parameters.items()
+                        if ClassifierWorkbookParser.parameter_key(parameter) == canonical
+                        for entry in found
+                    ]
+                    if entries and any(
+                        not ClassifierWorkbookParser.values_match(entries[0][0], value)
+                        for value, _source in entries[1:]
+                    ):
+                        return ValidationEngine.compare(expected, "", f"Conflicting job values for required table input: {name}.")
+                if any(ClassifierWorkbookParser.parameter_key(key) == canonical for key in inputs):
+                    continue
+                value = self._resolved_value(style_number, name, width, depth, section_number)
+                if value:
+                    inputs[name] = value
+                    continue
+                for parameter, found in self.parameter_variables.values.items():
+                    if ClassifierWorkbookParser.parameter_key(parameter) == canonical and len(found) == 1:
+                        inputs[name] = found[0]
+            actual, message = ClassifierWorkbookParser.identify_group(classified, base, inputs)
+            if scoped:
+                message += f" Section {section_number} inputs: " + "; ".join(
+                    source for _value, source in scoped.get_entries("Heat Test/Density")
+                )
+            if dimension_sources:
+                message += " Job inputs: " + "; ".join(dimension_sources) + "."
+            return ValidationEngine.compare(expected, actual, message)
 
         link_target = self._assembly_links.get(style_number)
         try:
@@ -3105,12 +4540,25 @@ class AuditReviewDemo(QMainWindow):
             return ValidationEngine.compare(expected, "", f"Workbook data unavailable: {exc}")
         matches = [match for sheet_name, rows in sheets for match in find_grid_group_matches(rows, sheet_name, base, "")]
         needed = {name for match in matches for name in match.required_parameters}
+        compared_dimensions = {
+            normalize_code(name) for match in matches
+            for name in grid_parameter_values(match)
+        }
+        if mapping:
+            compared_dimensions.update(normalize_code(name) for name in mapping.parameters if name)
+        for name, error in dimension_errors.items():
+            if name in compared_dimensions or name in {normalize_code(item) for item in needed}:
+                return ValidationEngine.compare(expected, "", error)
         needed.update(("Metering Configuration", "Door Vents"))
         for name in needed:
             repository = getattr(self, "_parameter_repository", None)
-            if repository and repository.has_conflict(name):
+            is_supplied_dimension = (
+                ConfigurationRepository._normalized(name) in WIDTH_LABELS and width
+                or ConfigurationRepository._normalized(name) in DEPTH_LABELS and depth
+            )
+            if repository and repository.has_conflict(name) and not is_supplied_dimension:
                 return ValidationEngine.compare(expected, "", f"Conflicting job values for required table input: {name}.")
-            value = self._resolved_value(style_number, name, width, depth) or from_description.get(name, "")
+            value = from_description.get(name, "") or self._resolved_value(style_number, name, width, depth, section_number)
             if value and name not in values:
                 values[name] = value
         if width:
@@ -3129,6 +4577,8 @@ class AuditReviewDemo(QMainWindow):
             sources = "; ".join(source for _value, source in scoped.get_entries("Heat Test/Density"))
             message += f" Section {section_number} Heat Test/Density = {values['Heat Test/Density']}. Source: {sources}"
 
+        if dimension_sources:
+            message += " Job inputs: " + "; ".join(dimension_sources) + "."
         return ValidationEngine.compare(expected, actual, message)
 
     def _grid_values(self, style_number, mapping, structure_width, description=""):
@@ -3159,19 +4609,26 @@ class AuditReviewDemo(QMainWindow):
     def add_checkbox(self, section_item, key, style_number, description, width, depth, structure_width="", structure_depth="", section_number=None):
 
         result = self._dimension_results.get(style_number, DimensionResult())
-        tables, tables_error = self._family_tables(style_number)
-        mapping = self._code_mapping_for(style_number, tables)
+        validation = self._validation_scope_result(style_number)
+        tables, tables_error = self._family_tables(style_number) if validation is None else ((), validation.message)
+        mapping = self._code_mapping_for(style_number, tables) if validation is None else None
+        if mapping is not None:
+            self._ensure_parameter_columns(len(mapping.parameters))
         count = self._parameter_columns
         base, expected_group = split_style_number(style_number)
-        width = structure_width or width
-        depth = structure_depth or depth
+        description_values = description_parameter_values(description)
+        job_width = structure_width or description_values.get("Width (Wide)", "")
+        job_depth = structure_depth or description_values.get("Depth", "")
+        width = job_width or dimension_value(self._dimension_entries("Width (Wide)", section_number))
+        depth = job_depth or dimension_value(self._dimension_entries("Depth", section_number))
         colors = {}
         tips = {}
         scoped = assembly_bus_requirements(self._section_bus_requirements, section_number, description)
 
         if mapping is not None:
+            classified = any(table.classifier_type for table in tables)
             workbook_values = {
-                **self._grid_values(style_number, mapping, structure_width, description),
+                **({} if classified else self._grid_values(style_number, mapping, structure_width, description)),
                 **TableValueExtractor.extract(
                     tables, base, expected_group,
                     {
@@ -3185,7 +4642,7 @@ class AuditReviewDemo(QMainWindow):
                 if not name:
                     parameter_cells.append("")
                     continue
-                job_value = self._resolved_value(style_number, name, width, depth)
+                job_value = self._resolved_value(style_number, name, width, depth, section_number)
                 scoped_entries = scoped.get_entries(name) if scoped else ()
                 if scoped_entries:
                     job_value = scoped.get_parameter(name) or "CONFLICT"
@@ -3195,29 +4652,38 @@ class AuditReviewDemo(QMainWindow):
                     text += f" [Index2: {sheet_value}]"
                     tips[column] = f"Job files: {job_value or 'not found'}\nIndex2 workbook ({base} {expected_group}): {sheet_value}"
                     if job_value:
-                        colors[column] = "#188038" if values_match(sheet_value, job_value) else "#d93025"
+                        matches = ClassifierWorkbookParser.values_match(sheet_value, job_value) if classified else values_match(sheet_value, job_value)
+                        colors[column] = "#188038" if matches else "#d93025"
                 if scoped_entries:
                     tips[column] = tips.get(column, "") + "\nSection requirement: " + "; ".join(source for _value, source in scoped_entries)
                 parameter_cells.append(text)
             parameter_cells += [""] * (count - len(parameter_cells))
             cells = [mapping.name, mapping.code, *parameter_cells]
-            tip = f"Checklist Sheet1 row: {mapping.code}"
+            mode = (
+                "Manually mapped (column N = TRUE)" if mapping.manually_mapped is True
+                else "Automatic extraction (column N is not TRUE)" if mapping.manually_mapped is False and mapping.checklist_row
+                else "Automatic extraction (no checklist row)" if mapping.manually_mapped is False
+                else "Python parameter mapping"
+            )
+            tip = f"{mode}\nChecklist row {mapping.checklist_row or '-'}: {mapping.code}"
+            for column in range(4, 4 + count):
+                tips[column] = tip + ("\n" + tips[column] if column in tips else "")
         else:
             cells = [""] * (2 + count)
             family = self._assembly_families.get(style_number)
-            tip = (
-                f"No Sheet1 Code row matches '{family}'." if family
+            tip = validation.message if validation is not None else (
+                f"No checklist Code row matches '{family}'." if family
                 else f"Family not resolved from Index2: {result.message}"
             )
 
-        description_values = description_parameter_values(description)
-        validation = self.validate_assembly(
-            style_number, mapping,
-            structure_width or description_values.get("Width (Wide)", ""),
-            structure_depth or description_values.get("Depth", ""),
-            tables, tables_error, description, section_number,
-        )
+        if validation is None:
+            validation = self.validate_assembly(
+                style_number, mapping,
+                job_width, job_depth,
+                tables, tables_error, description, section_number,
+            )
         self._validation_results[key] = validation
+        self._validation_checks.setdefault(style_number.strip().upper(), []).append(validation.status)
 
         item = QTreeWidgetItem(
             section_item,
@@ -3253,18 +4719,16 @@ class AuditReviewDemo(QMainWindow):
             pct = int(checked / total * 100)
             self.progress.setValue(pct)
 
-        self.progress.setFormat(f"{checked}/{total} checks completed (%p%)")
+        self.progress.setFormat(f"Manual review: {checked}/{total} assembly/structure rows (%p%)")
         if not total:
             self.progress.setValue(0)
         if hasattr(self, "summary_labels"):
-            self.summary_labels["total"].setText(str(total))
-            self.summary_labels["mapped"].setText(str(sum(bool(item.text(3)) for item in self.checkbox_items.values())))
-            for status in ("PASS", "FAIL", "UNRESOLVED"):
-                self.summary_labels[status].setText(str(sum(item.text(item.columnCount() - 1) == status for item in self.checkbox_items.values())))
+            self._update_coverage_metrics()
             self._apply_audit_filters()
 
     def closeEvent(self, event):
 
+        self._run_timer.stop()
         self._tab_animation.stop()
         self._excel_com.close()
         super().closeEvent(event)
@@ -3294,15 +4758,15 @@ class AuditReviewDemo(QMainWindow):
         QLabel#jobLabel { color: #637692; padding: 8px 12px; background: #e9eff9; border-radius: 7px; }
         QFrame#summary { background: transparent; border: none; }
         QFrame[metricCard="true"] { background: #ffffff; border: 1px solid #dfe7f3; border-radius: 10px; }
-        QFrame#cardPASS { background: #effaf5; border-color: #ccebdc; }
+        QFrame#cardPASS, QFrame#cardpresent { background: #effaf5; border-color: #ccebdc; }
         QFrame#cardFAIL { background: #fff3f3; border-color: #f3d6d9; }
-        QFrame#cardUNRESOLVED { background: #fff9ed; border-color: #efdfbc; }
+        QFrame#cardUNRESOLVED, QFrame#cardmissing { background: #fff9ed; border-color: #efdfbc; }
         QFrame[metricCard="true"] QLabel { background: transparent; }
         QLabel[metric="true"] { font-family: 'Bahnschrift'; font-size: 28px; font-weight: 600; }
-        QLabel#metrictotal, QLabel#metricmapped { color: #356bf0; }
-        QLabel#metricPASS { color: #14804a; }
+        QLabel#metricvalidation_total, QLabel#metricvalidation_rate, QLabel#metricall_assemblies, QLabel#metricgh_assemblies, QLabel#metriccoverage_rate { color: #356bf0; }
+        QLabel#metricPASS, QLabel#metricpresent { color: #14804a; }
         QLabel#metricFAIL { color: #c13342; }
-        QLabel#metricUNRESOLVED { color: #a66a08; }
+        QLabel#metricUNRESOLVED, QLabel#metricmissing { color: #a66a08; }
         QLabel#metricCaption { font-size: 11px; color: #68788b; }
         QGroupBox, QTabWidget::pane { border: none; margin: 0; padding: 0; }
         QPushButton { background: #ffffff; color: #254d87; border: 1px solid #cdd9ea; border-radius: 8px; padding: 8px 14px; font-weight: 600; min-height: 18px; }
@@ -3330,6 +4794,11 @@ class AuditReviewDemo(QMainWindow):
         QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical { height: 0; }
         QScrollBar::add-page:vertical, QScrollBar::sub-page:vertical { background: transparent; }
         QLabel#scan_status { color: #67758a; font-size: 11px; }
+        QLabel#runIndicator { color: #637692; font-weight: 600; font-size: 12px; }
+        QLabel#runIndicator[runState="running"] { color: #2454ca; }
+        QLabel#runIndicator[runState="completed"] { color: #14804a; }
+        QLabel#runIndicator[runState="attention"] { color: #a66a08; }
+        QLabel#runIndicator[runState="failed"] { color: #c13342; }
         QProgressBar { background: #e8edf4; color: #29455f; border: none; border-radius: 4px; text-align: center; font-size: 11px; }
         QProgressBar::chunk { background: qlineargradient(x1:0, y1:0, x2:1, y2:0, stop:0 #8eb8ff, stop:1 #78d8c0); border-radius: 4px; }
         QToolTip { background: #ffffff; color: #243347; border: 1px solid #cdd9ea; padding: 6px; }
@@ -3345,3 +4814,4 @@ if __name__ == "__main__":
     window.showMaximized()
 
     sys.exit(app.exec())
+

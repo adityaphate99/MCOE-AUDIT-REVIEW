@@ -1,0 +1,145 @@
+{
+  "threshold": 0.6,
+
+  "keyword_mapping": {
+
+    "AL": "Aluminum",
+    "ALUM": "Aluminum",
+    "ALUMINUM": "Aluminum",
+    "Aluminium": "Aluminum",
+
+    "COPPER": "Copper",
+
+    "CUAG": "Silver Plated Copper",
+    "Copper AG": "Silver Plated Copper",
+    "SILVER PLATED COPPER": "Silver Plated Copper",
+
+    "CUSN": "Tin Plated Copper",
+    "Copper SN": "Tin Plated Copper",
+    "TIN PLATED COPPER": "Tin Plated Copper",
+
+    "HT": "Heat Test",
+    "DEN": "Density",
+
+    "AMP": "Amperage",
+    "AMPS": "Amperage",
+    "Ampere": "Amperage",
+    "Ampacity": "Amperage",
+
+    "VLT": "Voltage",
+    "Volt": "Voltage",
+
+    "SYS": "System",
+
+    "MTG": "Mounting",
+
+    "W/": "With",
+    "W/O": "Without",
+
+    "UPR": "Upper",
+
+    "PD": "Power Breaker",
+
+    "FRT": "Front",
+
+    "EXT": "External",
+
+    "NEUT": "Neutral",
+
+    "GND": "Ground",
+
+    "CVR": "Cover",
+
+    "INDOOR": "Indoor",
+    "OUTDOOR": "Outdoor",
+
+    "(3) PHASE": "3 Phase",
+    "THREE PHASE": "3 Phase",
+
+    "(1) PHASE": "1 Phase",
+    "SINGLE PHASE": "1 Phase",
+
+    "Cross Bus Position": "Bus Position",
+    "Bus Position": "Bus Position",
+    "Cross Bus Pos": "Bus Position"
+  },
+
+  "parameters": {
+    "Mounting": {
+      "aliases": ["MTG"]
+    },
+    "With": {
+      "aliases": ["W/"]
+    },
+    "Without": {
+      "aliases": ["W/O"]
+    },
+    "Upper": {
+      "aliases": ["UPR"]
+    },
+    "Power Breaker": {
+      "aliases": ["PD"]
+    },
+    "Front": {
+      "aliases": ["FRT"]
+    },
+    "External": {
+      "aliases": ["EXT"]
+    },
+    "Neutral": {
+      "aliases": ["NEUT"]
+    },
+    "Ground": {
+      "aliases": ["GND"]
+    },
+    "Cover": {
+      "aliases": ["CVR"]
+    },
+    "Amperage": {
+      "aliases": ["AMP", "Amp", "Ampere", "Ampacity", "AMPS"]
+    },
+    "System": {
+      "aliases": ["SYS", "Sys"]
+    },
+    "Voltage": {
+      "aliases": ["VLT", "Volt"]
+    },
+    "Material": {
+      "aliases": ["Aluminum","ALUMINUM","Aluminium", "Copper", "COPPER", "Copper AG", "Copper SN", "AL", "CUAG", "CUSN", "ALUM","Silver Plated Copper","Tin Plated Copper"]
+    },
+    "Assembly Number": {
+      "aliases": ["Assembly No.", "DWG No.", "Part Number", "Part No.", "Drawing Number", "Family Numbers", "ASSY DWG"]
+    },
+     " Test": {
+      "aliases": ["Heat Test", "Density","HT","DEN"]
+    },
+    
+        "Phase": {
+      "aliases": ["3 Phase", "1 Phase","(3) Phase", "(1) Phase","Three Phase","Single Phase"]
+    },
+          "Structure Width": {
+      "aliases": ["Width", "Width(Wide)", "Structure Width(Wide)", "Structure Width", "Wide Structure", "Section Width"]
+    },
+          "Plated": {
+      "aliases": ["Tin Plated", "Silver Plated"]
+    },
+       "Structure Depth": {
+      "aliases": ["Depth", "Minimum Structure Depth"]
+    },
+           "Structure Height": {
+      "aliases": ["Height"]
+    },
+         "Location": {
+      "aliases": ["Indoor", "Outdoor", "Bus Location"]
+    },
+         "Activity": {
+      "aliases": ["Seismic or Non-Seismic","Galvanized Steel Seismic or Non-Seismic","Hasp Provision for Utility Locks"]
+    },
+    "Bus Position":{
+      "aliases": ["Cross Bus Position", "Bus Position", "Cross bus pos", "Bus Pos"]
+    },
+    "Rating":{
+      "aliases": ["Bus Rating"]
+    }
+  }
+}
